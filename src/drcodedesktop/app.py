@@ -36,6 +36,7 @@ from .core_shell import CoreShell
 from .event_hub import EventHub, log_path_for
 from .gui_config import GuiConfig
 from .merge_model import UnmergedEntry, collect_unmerged_entries
+from .model_catalog_dialog import ModelCatalogDialog
 from .model_settings_dialog import ModelSettingsDialog
 from .notifications_dialog import NotificationsDialog
 from .qt_host import QtHost
@@ -91,14 +92,18 @@ class MainWindow(QMainWindow):
         self._settings_project_action.triggered.connect(self._open_project_settings)
         self._settings_models_action = QAction("&Models…", self)
         self._settings_models_action.triggered.connect(self._open_model_settings)
+        self._settings_catalog_action = QAction("Provider &catalog…", self)
+        self._settings_catalog_action.triggered.connect(self._open_model_catalog)
         self._notifications_action = QAction("&Notifications…", self)
         self._notifications_action.triggered.connect(self._open_notifications)
         settings_menu.addAction(self._settings_project_action)
         settings_menu.addAction(self._settings_models_action)
+        settings_menu.addAction(self._settings_catalog_action)
         settings_menu.addAction(self._notifications_action)
         self.menuBar().addMenu(settings_menu)
         self._settings_project_action.setEnabled(False)
         self._settings_models_action.setEnabled(False)
+        self._settings_catalog_action.setEnabled(False)
         self._notifications_action.setEnabled(False)
 
         # The parity dialogs of plan task 7: token usage (the persistent
@@ -154,6 +159,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"DrCode Desktop — {project_root.name}")
         self._settings_project_action.setEnabled(True)
         self._settings_models_action.setEnabled(True)
+        self._settings_catalog_action.setEnabled(True)
         self._notifications_action.setEnabled(True)
         self._usage_action.setEnabled(True)
         self._stats_action.setEnabled(True)
@@ -245,6 +251,14 @@ class MainWindow(QMainWindow):
         drcode.json (the TUI's Project-model-settings twin)."""
         if self._shell is not None:
             ModelSettingsDialog(self._shell, self).exec()
+
+    def _open_model_catalog(self) -> None:
+        """Settings → "Provider catalog…": the user-level models.json
+        editor (the TUI's ModelCatalogScreen twin). Nothing persists
+        until the dialog's Save; on accept the shell's per-role
+        resolutions are recomputed (the dialog itself drops the cache)."""
+        if self._shell is not None:
+            ModelCatalogDialog(self._shell, self).exec()
 
     def _open_notifications(self) -> None:
         """Settings → "Notifications…": the ntfy.sh enable/topic form;
