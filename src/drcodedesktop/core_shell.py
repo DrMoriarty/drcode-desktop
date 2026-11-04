@@ -61,6 +61,7 @@ from drcode.usage_store import UsageStore, usage_file
 from drcode.workflow import load_hooks
 from PySide6.QtCore import QTimer
 
+from .activity_view import fmt_age
 from .event_hub import EventHub
 from .qt_host import QtHost
 
@@ -252,6 +253,9 @@ class CoreShell(PipelineLayer):
         self.set_interval(30, self._poll_dependency_unblock)
         # Keep-awake safety tick.
         self.set_interval(5, self._update_keepawake)
+        # Stall watchdog (plan task 7): a 1 s tick aborts and restarts a
+        # run that has emitted nothing for the configured stall limit.
+        self.set_interval(1.0, self._poll_stall)
         # Pre-stamp the isolation pins of tasks that were mid-work at
         # the previous shutdown (must land BEFORE the first _advance).
         if self.task_env.available:
@@ -464,6 +468,70 @@ class CoreShell(PipelineLayer):
         with contextlib.suppress(Exception):
             self._usage_store.record(role, model_id, usage)
 
+    def _collect_session_stats(self) -> None:
+        """Fold task-tree changes into the session counters (the port of
+        ``tui.header_view._collect_session_stats``): tasks that appeared
+        since the previous tick count as created this session (by kind),
+        tasks that reached COMPLETED count as processed, with the
+        activation → completion span (a task cancelled straight from the
+        queue has no activation stamp and is counted without a
+        duration). Runs on the 1 s activity poll."""
+        tasks = self.manager.tasks
+        for task_id in set(tasks) - self._session_known_ids:
+            self._session_known_ids.add(task_id)
+            self._session_created[tasks[task_id].kind] += 1
+        for task in tasks.values():
+            if (
+                task.status is TaskStatus.COMPLETED
+                and task.id not in self._session_completed_ids
+            ):
+                self._session_completed_ids.add(task.id)
+                self._session_completed += 1
+                if task.activated_at and task.completed_at:
+                    self._session_durations.append(
+                        (task.completed_at - task.activated_at).total_seconds()
+                    )
+
+    # -- stall watchdog (plan task 7, port of tui.activity_view._poll_stall) -----
+
+    def _poll_stall(self) -> None:
+        """Watchdog: when a running agent/tester/resolver has emitted
+        nothing (no stream deltas, no tool events) for the configured
+        stall limit, abort the hung run and restart it — ONLY that run:
+        with parallel development slots every run gets its own stall
+        deadline and its own nudge, and the healthy siblings keep
+        running. A stalled run blocks its own task — and through the
+        pipeline gate, the whole backlog — so this keeps an overnight
+        run going without human intervention."""
+        limit = self.settings.stall_nudge.minutes
+        if limit is None:
+            return
+        now = time.monotonic()
+        running: list[tuple[str, str]] = [
+            (task_id, "agent") for task_id in list(self._agent_runs)
+        ]
+        if self.tester_running and self._tester_task_id:
+            running.append((self._tester_task_id, "tester"))
+        if self._resolver_running and self._resolver_task_id:
+            running.append((self._resolver_task_id, "resolver"))
+        for task_id, who in running:
+            stamped = self._last_activity.get(task_id)
+            if stamped is None:
+                continue  # the run has not started emitting yet
+            stalled_for = now - stamped
+            if stalled_for < limit * 60:
+                continue
+            task = self.manager.tasks.get(task_id)
+            if task is None:
+                continue
+            self._show_event(
+                task,
+                f"{who} stalled for {fmt_age(int(stalled_for))} without any "
+                f"activity — aborting the run (stall limit: "
+                f"{self.settings.stall_nudge.label})",
+            )
+            self._nudge_run(task)
+
     # -- UI-layer protocol: connection / outage -----------------------------------
 
     def _active_header_role(self) -> AgentRole:
@@ -505,9 +573,35 @@ class CoreShell(PipelineLayer):
         self._show_event(task, "Merge conflicts parked — open the merge screen.")
 
     def _unmerged_completed_ids(self) -> list[str]:
-        # Full git-based parity is task-7 work; the skeleton reports
-        # nothing unmerged (this only gates a reminder message).
-        return []
+        """Ids of completed tasks whose ``drcode/<task-id>`` branch still
+        holds commits the base branch does not have — the count behind
+        the git indicator (the GUI port of
+        ``tui.app._unmerged_completed_ids``, simplified: the wholesale
+        ``drcode_branch_state`` snapshot over every completed task, no
+        accept-hook merge audit and no stale triage-report sweep — those
+        ship with the merge screen, plan task 9; see PARITY.md).
+        Blocking git calls — run off the loop thread by the caller."""
+        env = self.task_env
+        if not env.active:
+            self._merge_state = {}
+            return []
+        candidates = [
+            t
+            for t in self.manager.tasks.values()
+            if t.status is TaskStatus.COMPLETED
+        ]
+        existing, unmerged = env.drcode_branch_state()
+        self._merge_state = {
+            t.id: (
+                "unmerged"
+                if env.branch(t.id) in unmerged
+                else "merged"
+                if env.branch(t.id) in existing
+                else "none"
+            )
+            for t in candidates
+        }
+        return [t.id for t in candidates if env.branch(t.id) in unmerged]
 
     # -- user input / run control (plan task 4) ------------------------------------
     #
@@ -1097,6 +1191,29 @@ class CoreShell(PipelineLayer):
         )
         self._advance()
         self._update_keepawake()
+
+    def apply_notifications_settings(self, enabled: bool, topic: str) -> None:
+        """The Save of the notifications dialog (the GUI port of
+        ``tui.actions_settings._notifications_settings_done``): persist
+        the enable/topic pair into the project settings (the same file
+        the TUI writes) and fire the test push so the user can check the
+        subscription right away."""
+        self.settings.notifications_enabled = enabled
+        self.settings.ntfy_topic = topic
+        self.settings_store.save(self.settings)
+        self._hub.emit_notify(
+            f"Notifications: {'on' if enabled else 'off'}"
+            + (f" (ntfy.sh/{topic})" if enabled and topic else ""),
+            "Project settings",
+            "information",
+        )
+        if enabled and topic:
+            self.notifier.notify(
+                "DrCode: notifications enabled",
+                f'Project "{self.project_root.name}": test '
+                "notification — the channel works.",
+                tags=["bell"],
+            )
 
     def apply_model_settings(
         self,

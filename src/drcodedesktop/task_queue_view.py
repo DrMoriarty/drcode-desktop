@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .activity_view import ActivityIndicator
 from .new_task_dialog import NewTaskDialog
 from .task_queue_model import TaskQueueModel
 
@@ -92,7 +93,11 @@ class TaskQueueView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(header)
         layout.addWidget(self._tree)
-
+        # The run-activity indicator (plan task 7): the sidebar bottom of
+        # the TUI — fresh/stale status, stall countdown, session stats,
+        # git unmerged-work counter.
+        self._activity = ActivityIndicator(shell)
+        layout.addWidget(self._activity)
         self._model.rows_changed.connect(self.rebuild)
         self.rebuild()
 
@@ -264,6 +269,7 @@ class TaskQueueView(QWidget):
         disconnect the model from the hub so no signal fires into a dead
         shell."""
         self._poll.stop()
+        self._activity.shutdown()
         self._model.detach()
         self._model.rows_changed.disconnect(self.rebuild)
         self._tree.clear()

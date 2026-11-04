@@ -34,9 +34,12 @@ from .core_shell import CoreShell
 from .event_hub import EventHub, log_path_for
 from .gui_config import GuiConfig
 from .model_settings_dialog import ModelSettingsDialog
+from .notifications_dialog import NotificationsDialog
 from .qt_host import QtHost
 from .settings_dialog import ProjectSettingsDialog
+from .stats_dialog import StatsDialog
 from .task_queue_view import TaskQueueView
+from .usage_dialog import UsageDialog
 
 
 class MainWindow(QMainWindow):
@@ -84,11 +87,29 @@ class MainWindow(QMainWindow):
         self._settings_project_action.triggered.connect(self._open_project_settings)
         self._settings_models_action = QAction("&Models…", self)
         self._settings_models_action.triggered.connect(self._open_model_settings)
+        self._notifications_action = QAction("&Notifications…", self)
+        self._notifications_action.triggered.connect(self._open_notifications)
         settings_menu.addAction(self._settings_project_action)
         settings_menu.addAction(self._settings_models_action)
+        settings_menu.addAction(self._notifications_action)
         self.menuBar().addMenu(settings_menu)
         self._settings_project_action.setEnabled(False)
         self._settings_models_action.setEnabled(False)
+        self._notifications_action.setEnabled(False)
+
+        # The parity dialogs of plan task 7: token usage (the persistent
+        # per-day store), project statistics (Ctrl+G).
+        reports_menu = QMenu("&Reports", self.menuBar())
+        self._usage_action = QAction("Token usage…", self)
+        self._usage_action.triggered.connect(self._open_usage_dialog)
+        self._stats_action = QAction("Statistics…", self)
+        self._stats_action.setShortcut(QKeySequence("Ctrl+G"))
+        self._stats_action.triggered.connect(self._open_stats_dialog)
+        reports_menu.addAction(self._usage_action)
+        reports_menu.addAction(self._stats_action)
+        self.menuBar().addMenu(reports_menu)
+        self._usage_action.setEnabled(False)
+        self._stats_action.setEnabled(False)
 
     # -- project lifecycle ----------------------------------------------------
 
@@ -118,6 +139,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"DrCode Desktop — {project_root.name}")
         self._settings_project_action.setEnabled(True)
         self._settings_models_action.setEnabled(True)
+        self._notifications_action.setEnabled(True)
+        self._usage_action.setEnabled(True)
+        self._stats_action.setEnabled(True)
         self._console_append(f"=== project: {project_root} ===")
         self._console_append(f"log file: {log_path_for(project_root)}")
         # Start once the event loop is running (workers/timers need it).
@@ -148,6 +172,9 @@ class MainWindow(QMainWindow):
         self._model_label.setText("no project")
         self._settings_project_action.setEnabled(False)
         self._settings_models_action.setEnabled(False)
+        self._notifications_action.setEnabled(False)
+        self._usage_action.setEnabled(False)
+        self._stats_action.setEnabled(False)
 
     def _install_queue_view(self) -> None:
         """The queue screen of the freshly opened project (its model
@@ -203,6 +230,37 @@ class MainWindow(QMainWindow):
         drcode.json (the TUI's Project-model-settings twin)."""
         if self._shell is not None:
             ModelSettingsDialog(self._shell, self).exec()
+
+    def _open_notifications(self) -> None:
+        """Settings → "Notifications…": the ntfy.sh enable/topic form;
+        Save persists into the project settings (the TUI's
+        Notifications dialog twin) and fires the test push."""
+        if self._shell is None:
+            return
+        settings = self._shell.settings
+        dialog = NotificationsDialog(
+            enabled=settings.notifications_enabled,
+            topic=settings.ntfy_topic,
+            parent=self,
+        )
+        if dialog.exec() != NotificationsDialog.DialogCode.Accepted:
+            return
+        setup = dialog.setup
+        self._shell.apply_notifications_settings(setup.enabled, setup.topic)
+
+    # -- report dialogs (plan task 7) ----------------------------------------------
+
+    def _open_usage_dialog(self) -> None:
+        """Reports → "Token usage…": the persistent per-day, per-model
+        token usage from ~/.config/drcode/usage.json (read-only)."""
+        dialog = UsageDialog(parent=self)
+        dialog.exec()
+
+    def _open_stats_dialog(self) -> None:
+        """Reports → "Statistics…" (Ctrl+G): the project's day buckets
+        from <project>/.drcode/stats.json (read-only)."""
+        if self._shell is not None:
+            StatsDialog(self._shell.project_root, self).exec()
 
     def _pick_project(self) -> None:
         start = self._config.last or str(Path.home())

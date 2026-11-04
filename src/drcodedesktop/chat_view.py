@@ -61,6 +61,7 @@ from .rich_to_qt import (
     mention_text_html,
     segments_html,
 )
+from .todo_panel import TodoPanel
 
 if TYPE_CHECKING:
     from .core_shell import CoreShell
@@ -143,9 +144,15 @@ class ChatTimelineView(QWidget):
         input_row.addWidget(self._input, stretch=1)
         input_row.setContentsMargins(0, 4, 0, 0)
 
+        # The todo checklist strip (plan task 7): sits between the chat
+        # history and the input row (the TUI's #todo-panel slot), driven
+        # by the same task_updated/view_task events as the rebuild.
+        self._todo_panel = TodoPanel()
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self._scroll, stretch=1)
+        outer.addWidget(self._todo_panel)
         outer.addLayout(input_row)
 
         self._rebuild_timer = QTimer(self)
@@ -179,6 +186,7 @@ class ChatTimelineView(QWidget):
         self._task_id = None
         self._entries = []
         self._clear_layout()
+        self._todo_panel.update_todos(None, [])
         self._set_empty_hint()
 
     def mount_stream_block(self, block: StreamBlockBrowser) -> None:
@@ -226,6 +234,7 @@ class ChatTimelineView(QWidget):
         blocks, composer, run controls) must never outlive the
         application object (a hard Qt crash at teardown otherwise)."""
         self._rebuild_timer.stop()
+        self._todo_panel.shutdown()
         self._clear_layout()
         with contextlib.suppress(RuntimeError):
             self._hub.task_updated.disconnect(self._on_task_updated)
@@ -305,6 +314,10 @@ class ChatTimelineView(QWidget):
                 self._clarification_multi.clear()
             self._mount_option_buttons(task.clarification)
         self._reconcile_live_blocks(rendered.entries)
+        # The todo checklist strip rides the same rebuild (the
+        # todo_create / todo_update tool calls persist through
+        # task_updated, which schedules the rebuild).
+        self._todo_panel.update_todos(task.id, task.todos)
         if follow:
             self._follow_tail(force=True)
 

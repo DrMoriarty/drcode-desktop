@@ -5,7 +5,13 @@ PySide6 GUI shell over the in-process drcode core (git submodule `./drcode`).
 Screens: the live task queue (TUI sidebar parity) with the selected
 task's chat pane — the transcript rendered through a Rich→Qt adapter
 (markdown, fenced code, highlighted tool-call JSON, collapsible
-reasoning/tool-call blocks) plus live streaming of the active run.
+reasoning/tool-call blocks) plus live streaming of the active run. The
+chat pane carries the read-only todo checklist strip; the queue pane
+bottom shows the run-activity indicator (fresh/stale, stall countdown,
+session stats, git unmerged-work counter) driven by the shell's stall
+watchdog. Reports → Token usage / Statistics (Ctrl+G) read the same
+stores the TUI reads; Settings → Notifications writes the same project
+settings file. Parity state and explicit gaps: PARITY.md.
 
 ## Run
 
