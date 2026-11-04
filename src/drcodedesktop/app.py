@@ -10,9 +10,11 @@ pipeline share one thread, exactly like the Textual app.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -145,8 +147,6 @@ class MainWindow(QMainWindow):
         self._console_append(f"=== project: {project_root} ===")
         self._console_append(f"log file: {log_path_for(project_root)}")
         # Start once the event loop is running (workers/timers need it).
-        from PySide6.QtCore import QTimer
-
         QTimer.singleShot(0, self._start_shell)
 
     def close_project(self) -> None:
@@ -311,6 +311,12 @@ def main() -> int:
     window.show()
     if config.last and Path(config.last).is_dir():
         window.open_project(Path(config.last))
+
+    # Frozen-build verification (plan task 8 acceptance): the packaged
+    # shell boots, pumps the loop for a moment and exits 0 — the check
+    # CI and `scripts/build_dist.py --smoke` run against fresh artifacts.
+    if os.environ.get("DRCODE_DESKTOP_SMOKE") == "1":
+        QTimer.singleShot(1500, app.quit)
 
     with loop:
         return app.exec()

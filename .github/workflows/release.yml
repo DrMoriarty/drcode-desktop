@@ -1,0 +1,114 @@
+name: release
+
+# Plan task 8: build distributables of the GUI project (the PySide6
+# shell + the in-process drcode submodule) on macos-14 and ubuntu and
+# attach them to the GitHub release of the v* tag.
+#
+# The GUI version IS the drcode submodule version (the `version` file):
+# a tag whose number disagrees with the submodule fails the build.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Tag/submodule version parity
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="$(cat drcode/version)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} != drcode submodule version v${version}" >&2
+            exit 1
+          fi
+
+      - name: Sync (with the build group)
+        run: uv sync --group build
+
+      - name: Tests
+        run: uv run pytest
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+      - name: Build the .app bundle (sign + notarize when secrets are set)
+        run: uv run python scripts/build_dist.py --target macos --smoke
+        env:
+          DRCODE_CODESIGN_IDENTITY: ${{ secrets.DRCODE_CODESIGN_IDENTITY }}
+          DRCODE_NOTARY_KEY: ${{ secrets.DRCODE_NOTARY_KEY }}
+          DRCODE_NOTARY_KEY_ID: ${{ secrets.DRCODE_NOTARY_KEY_ID }}
+          DRCODE_NOTARY_ISSUER: ${{ secrets.DRCODE_NOTARY_ISSUER }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  build-linux:
+    # ubuntu-22.04 (not latest): the frozen output links the builder's
+    # glibc — building on 22.04 keeps the artifacts runnable on older
+    # x86_64 desktops too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Sync (with the build group)
+        run: uv sync --group build
+
+      - name: Lint and type check
+        run: |
+          uv run ruff check .
+          uv run pyright
+
+      - name: Tests
+        run: uv run pytest
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+      - name: Build the AppImage
+        run: uv run python scripts/build_dist.py --target appimage
+
+      - name: Build the .deb
+        run: uv run python scripts/build_dist.py --target deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+          if-no-files-found: error
+
+  release:
+    needs: [build-macos, build-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.AppImage
+            dist/*.deb
+          generate_release_notes: true
