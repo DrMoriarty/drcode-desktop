@@ -35,12 +35,14 @@ from .chat_view import ChatTimelineView
 from .core_shell import CoreShell
 from .event_hub import EventHub, log_path_for
 from .gui_config import GuiConfig
+from .merge_model import UnmergedEntry, collect_unmerged_entries
 from .model_settings_dialog import ModelSettingsDialog
 from .notifications_dialog import NotificationsDialog
 from .qt_host import QtHost
 from .settings_dialog import ProjectSettingsDialog
 from .stats_dialog import StatsDialog
 from .task_queue_view import TaskQueueView
+from .unmerged_screen import UnmergedDialog
 from .usage_dialog import UsageDialog
 
 
@@ -113,6 +115,17 @@ class MainWindow(QMainWindow):
         self._usage_action.setEnabled(False)
         self._stats_action.setEnabled(False)
 
+        # The merge-conflict entry (plan task 9): the TUI's Ctrl+M —
+        # one candidate opens the merge screen directly, several open
+        # the unmerged-branches list.
+        self._merge_action = QAction("Resolve conflicts…", self)
+        self._merge_action.setShortcut(QKeySequence("Ctrl+M"))
+        self._merge_action.triggered.connect(self._open_merge)
+        merge_menu = QMenu("&Merge", self.menuBar())
+        merge_menu.addAction(self._merge_action)
+        self.menuBar().addMenu(merge_menu)
+        self._merge_action.setEnabled(False)
+
     # -- project lifecycle ----------------------------------------------------
 
     def open_project(self, project_root: Path) -> None:
@@ -144,6 +157,7 @@ class MainWindow(QMainWindow):
         self._notifications_action.setEnabled(True)
         self._usage_action.setEnabled(True)
         self._stats_action.setEnabled(True)
+        self._merge_action.setEnabled(True)
         self._console_append(f"=== project: {project_root} ===")
         self._console_append(f"log file: {log_path_for(project_root)}")
         # Start once the event loop is running (workers/timers need it).
@@ -175,6 +189,7 @@ class MainWindow(QMainWindow):
         self._notifications_action.setEnabled(False)
         self._usage_action.setEnabled(False)
         self._stats_action.setEnabled(False)
+        self._merge_action.setEnabled(False)
 
     def _install_queue_view(self) -> None:
         """The queue screen of the freshly opened project (its model
@@ -261,6 +276,55 @@ class MainWindow(QMainWindow):
         from <project>/.drcode/stats.json (read-only)."""
         if self._shell is not None:
             StatsDialog(self._shell.project_root, self).exec()
+
+    # -- merge-conflict entry (plan task 9) --------------------------------------
+
+    def _collect_merge_candidates(self) -> list[UnmergedEntry]:
+        """Every ready merge candidate, fresh from git (sync, blocking —
+        the callers run it off the GUI thread)."""
+        shell = self._shell
+        if shell is None:
+            return []
+        return collect_unmerged_entries(
+            shell.project_root, shell.task_env, shell.manager.tasks
+        )
+
+    def _open_merge(self) -> None:
+        """Merge → "Resolve conflicts…" (Ctrl+M): the TUI's
+        ``action_open_merge`` — the viewed/needs-human task first, the
+        whole task list after; exactly one candidate opens the merge
+        screen directly, several open the unmerged-branches list."""
+        shell = self._shell
+        if shell is None:
+            return
+
+        def deliver(entries: list[UnmergedEntry]) -> None:
+            if not entries:
+                QMessageBox.information(
+                    self,
+                    "Merge",
+                    "No parked merge conflict and nothing unmerged — "
+                    "nothing to resolve.",
+                )
+                return
+            if len(entries) == 1:
+                from .merge_screen import MergeScreenDialog
+
+                MergeScreenDialog(shell, entries[0].task_id, self).exec()
+                return
+            UnmergedDialog(shell, self).exec()
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            deliver(self._collect_merge_candidates())
+            return
+
+        async def job() -> None:
+            entries = await asyncio.to_thread(self._collect_merge_candidates)
+            deliver(entries)
+
+        self._merge_job = asyncio.ensure_future(job())
 
     def _pick_project(self) -> None:
         start = self._config.last or str(Path.home())

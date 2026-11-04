@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from drcode import merge_engine
 from drcode.models import TaskStatus
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QMenu,
+    QMessageBox,
     QPushButton,
     QTreeWidget,
     QTreeWidgetItem,
@@ -40,6 +42,7 @@ from PySide6.QtWidgets import (
 )
 
 from .activity_view import ActivityIndicator
+from .merge_screen import MergeScreenDialog
 from .new_task_dialog import NewTaskDialog
 from .task_queue_model import TaskQueueModel
 
@@ -175,7 +178,33 @@ class TaskQueueView(QWidget):
             menu.addAction("Cancel task", lambda: self._run_action("cancel", task.id))
         if task.status is TaskStatus.HOLD:
             menu.addAction("Delete task", lambda: self._run_action("delete", task.id))
+        # The parked-conflict entry (plan task 9): the task the resolver
+        # gave up on (needs_human) — or one with a live in-progress merge
+        # — opens the conflict screen straight from the list.
+        if task.needs_human or self._merge_parked(task.id):
+            menu.addAction(
+                "Resolve merge conflicts…",
+                lambda: self._open_merge_screen(task.id),
+            )
         menu.exec(self._tree.viewport().mapToGlobal(pos))
+
+    def _merge_parked(self, task_id: str) -> bool:
+        """A live parked merge in the task's worktree (one cheap git
+        call, only when the menu is actually opened for the row)."""
+        env = self._shell.task_env
+        return env.active and merge_engine.in_progress(env.worktree_path(task_id))
+
+    def _open_merge_screen(self, task_id: str) -> None:
+        """The needs_human → screen edge from the task list."""
+        if not self._shell.task_env.active:
+            QMessageBox.warning(
+                self,
+                "Merge",
+                "The conflict screen needs worktree isolation "
+                "(project setting `task_isolation: worktree`).",
+            )
+            return
+        MergeScreenDialog(self._shell, task_id, self).exec()
 
     def _prompt_add_dependency(self, task_id: str) -> None:
         """The "Add dependency…" input: one task id (the ``#id`` mention
