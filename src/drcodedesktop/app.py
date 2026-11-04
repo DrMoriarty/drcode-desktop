@@ -22,12 +22,14 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QSplitter,
     QTabWidget,
     QToolBar,
     QWidget,
 )
 from qasync import QEventLoop
 
+from .chat_view import ChatTimelineView
 from .core_shell import CoreShell
 from .event_hub import EventHub, log_path_for
 from .gui_config import GuiConfig
@@ -54,6 +56,7 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(QWidget(), "Queue")  # replaced per project
         self._tabs.addTab(self._console, "Console")
         self._queue_view: TaskQueueView | None = None
+        self._chat_view: ChatTimelineView | None = None
         self.setCentralWidget(self._tabs)
 
         toolbar = QToolBar("main")
@@ -106,10 +109,18 @@ class MainWindow(QMainWindow):
     def close_project(self) -> None:
         if self._queue_view is not None:
             self._queue_view.shutdown()
-            self._tabs.removeTab(self._tabs.indexOf(self._queue_view))
+        if self._chat_view is not None:
+            self._chat_view.shutdown()
+        if self._host is not None:
+            self._host.clear_stream_sink(self._chat_view)
+        if self._queue_view is not None:
+            # The queue view lives inside the tab's splitter — remove the
+            # tab by position (it is always tab 0 while a project is open).
+            self._tabs.removeTab(0)
             self._queue_view.deleteLater()
             self._queue_view = None
             self._tabs.insertTab(0, QWidget(), "Queue")
+        self._chat_view = None
         if self._shell is not None:
             self._shell.shutdown()
             self._shell = None
@@ -119,11 +130,34 @@ class MainWindow(QMainWindow):
 
     def _install_queue_view(self) -> None:
         """The queue screen of the freshly opened project (its model
-        subscribes to the new hub; the placeholder tab is swapped out)."""
-        assert self._shell is not None and self._hub is not None
+        subscribes to the new hub; the placeholder tab is swapped out).
+        The tab is a splitter: the live queue left, the selected task's
+        chat pane right (plan task 3)."""
+        assert (
+            self._shell is not None
+            and self._hub is not None
+            and self._host is not None
+        )
         self._queue_view = TaskQueueView(self._shell, self._hub)
+        self._chat_view = ChatTimelineView(self._shell, self._hub)
+        self._queue_view.task_activated.connect(self._view_task)
+        self._chat_view.open_task_requested.connect(self._queue_view.select_task)
+        splitter = QSplitter()
+        splitter.addWidget(self._queue_view)
+        splitter.addWidget(self._chat_view)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        self._host.set_stream_sink(self._chat_view)
         self._tabs.removeTab(0)
-        self._tabs.insertTab(0, self._queue_view, "Queue")
+        self._tabs.insertTab(0, splitter, "Queue")
+
+    def _view_task(self, task_id: str) -> None:
+        """A task row was selected: open it in the core (the pipeline's
+        live blocks attribute to it) and render its transcript."""
+        if self._shell is not None:
+            self._shell.view_task(task_id)
+        if self._chat_view is not None:
+            self._chat_view.view_task(task_id)
 
     def _start_shell(self) -> None:
         if self._shell is not None:

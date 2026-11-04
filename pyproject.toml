@@ -58,6 +58,8 @@ ignore = [
     # The shell mirrors the core's own conventions (long docstrings etc.).
     "SIM108",
 ]
+# The chat pane renders the TUI's glyphs verbatim (parity).
+allowed-confusables = ["›", "—", "–", "─", "★", "▸", "▾", "⚙", "·"]
 
 [tool.pyright]
 include = ["src", "tests"]

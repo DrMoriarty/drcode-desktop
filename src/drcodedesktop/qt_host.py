@@ -23,8 +23,8 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QTimer
 
+from .chat_blocks import StreamBlockBrowser
 from .event_hub import EventHub
-from .stream_block import StreamBlockStub
 
 
 class QtHost(QObject):
@@ -37,10 +37,13 @@ class QtHost(QObject):
         # being dismantled (textual's ``_exit`` / ``is_running`` pair).
         self._active = False
         self._model_status_is_error = False
-        # Attribution of newly created stream blocks. Task 3 wires this
-        # to the viewed task; the skeleton keeps it empty (blocks are
-        # logged, not mounted into a task view).
+        # Attribution of newly created stream blocks: the id the shell is
+        # running blocks for (CoreShell.view_task keeps it in sync with
+        # its viewed_id).
         self.current_task_id = ""
+        # The chat view of the open task (the stream sink): blocks whose
+        # task matches are mounted into it as the pipeline creates them.
+        self._stream_sink: Any = None
         # Worker pool: group name -> the in-flight asyncio task. Textual's
         # worker registry is the semantic base of the per-task run groups
         # (``agent-<task-id>``) and the single tester/resolver slots.
@@ -189,14 +192,64 @@ class QtHost(QObject):
 
     # -- live chat blocks ------------------------------------------------------
 
+    def set_stream_sink(self, sink: Any) -> None:
+        """Register the open chat view (the sink the pipeline's live
+        blocks mount into while their task is viewed)."""
+        self._stream_sink = sink
+
+    def clear_stream_sink(self, sink: Any) -> None:
+        if self._stream_sink is sink:
+            self._stream_sink = None
+
+    def _make_stream_block(
+        self,
+        kind: str,
+        at: datetime.datetime | None = None,
+        content: str = "",
+    ) -> StreamBlockBrowser:
+        block = StreamBlockBrowser(kind, self.current_task_id, at)
+        if content:
+            block.set_content(content)
+        sink = self._stream_sink
+        if (
+            sink is not None
+            and self.current_task_id
+            and getattr(sink, "task_id", None) == self.current_task_id
+        ):
+            sink.mount_stream_block(block)
+        return block
+
     def host_new_reasoning_block(self, at: datetime.datetime | None = None) -> Any:
-        return StreamBlockStub(self._hub, self.current_task_id, "reasoning", at)
+        return self._make_stream_block("reasoning", at=at)
 
     def host_new_assistant_block(self) -> Any:
-        return StreamBlockStub(self._hub, self.current_task_id, "assistant")
+        return self._make_stream_block("assistant")
 
     def host_new_tool_call_block(self, call_text: str) -> Any:
-        block = StreamBlockStub(self._hub, self.current_task_id, "tool-call")
-        block.set_content(call_text)
-        self._hub.emit_service_event(self.current_task_id, "tool", call_text)
-        return block
+        return self._make_stream_block("tool-call", content=call_text)
+
+    def stream_sink_write_line(self, role: str, text: str, at: Any = None) -> None:
+        """Forward one live history write (consumed prompt, round
+        separator) to the open chat view, if it shows this task."""
+        sink = self._stream_sink
+        if sink is not None and getattr(sink, "task_id", None) == self.current_task_id:
+            sink.live_history_line(role, text, at)
+
+    def stream_sink_write_clarification(self, clarification: Any) -> None:
+        sink = self._stream_sink
+        if sink is not None and getattr(sink, "task_id", None) == self.current_task_id:
+            sink.live_clarification(clarification)
+
+    def stream_sink_at_bottom(self) -> bool:
+        """The TUI's _chat_at_bottom: is the open view tracking the tail?"""
+        sink = self._stream_sink
+        if sink is None or getattr(sink, "task_id", None) != self.current_task_id:
+            return False
+        return bool(sink.at_bottom())
+
+    def stream_sink_follow(self) -> None:
+        """The TUI's _stream_follow: keep the tail visible while the
+        reader is at the bottom."""
+        sink = self._stream_sink
+        if sink is not None and getattr(sink, "task_id", None) == self.current_task_id:
+            sink.follow_tail()

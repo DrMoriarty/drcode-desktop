@@ -202,6 +202,8 @@ class CoreShell(PipelineLayer):
         # Run-state activity bookkeeping (parallel slots).
         self._last_activity: dict[str, float] = {}
         self._current_tool: dict[str, str | None] = {}
+        # Live tool-call blocks by run/call id (spinner stops on result).
+        self._active_tools: dict[tuple[str, str, int], dict[str, Any]] = {}
         self._tps_samples: dict[str, deque[tuple[float, int]]] = {}
         self._conn_label = "○ not probed (skeleton)"
         self._conn_role: AgentRole | None = None
@@ -334,8 +336,9 @@ class CoreShell(PipelineLayer):
         expand: bool = False,
         note: Any = None,
     ) -> None:
-        """Headless chat write: a StreamBlock accumulates silently; any
-        other content is logged verbatim into the session log."""
+        """Headless chat write: a StreamBlock was already handed to the
+        open chat view at creation (the QtHost sink); anything else is
+        logged verbatim into the session log."""
         del expand, note
         text = getattr(content, "get_content", None)
         if callable(text):
@@ -344,16 +347,20 @@ class CoreShell(PipelineLayer):
             self._hub.append_log(f"chat {content!r}")
 
     def _write_history_line(self, role: str, text: str, at: Any = None) -> Any:
-        del at
-        self._hub.emit_service_event(self.viewed_id or "", role, text)
+        """A live history write of a running pipeline (a consumed prompt
+        entering the view, a testing/resolving separator): forwarded to
+        the open chat view (the persisted transcript covers it at the
+        next rebuild)."""
+        self._hub.append_log(f"history {role}: {text!r}")
+        self._host.stream_sink_write_line(role, text, at)
         return None
 
     def _write_clarification(self, clarification: Clarification) -> None:
-        self._hub.emit_service_event(
-            self.viewed_id or "",
-            "clarification",
-            "; ".join(q.question for q in clarification.questions),
+        self._hub.append_log(
+            "clarification: "
+            + "; ".join(q.question for q in clarification.questions)
         )
+        self._host.stream_sink_write_clarification(clarification)
 
     def _isolation_pin_note(self, task: Task, *, save: bool) -> None:
         """Run-boundary bookkeeping for the isolation pin (mirrors
@@ -410,15 +417,29 @@ class CoreShell(PipelineLayer):
         call_text: str,
         block: Any,
     ) -> None:
-        del run_key, block
+        # The live tool-call block keeps spinning in the chat view until
+        # the result event stops it (registry over all runs — the agent
+        # and the tester never overlap, but the lookup covers both).
+        self._active_tools.setdefault(run_key, {})[call_id] = block
         self._touch_activity(task_id, call_text)
         self._hub.emit_service_event(task_id, "tool", call_text)
 
     def _tool_call_finished(self, call_id: str) -> None:
+        for per_run in self._active_tools.values():
+            block = per_run.pop(call_id, None)
+            if block is not None:
+                stop = getattr(block, "stop_spinner", None)
+                if callable(stop):
+                    stop()
         self._hub.append_log(f"tool finished {call_id}")
 
     def _stop_run_tools(self, run_key: tuple[str, str, int]) -> None:
-        del run_key
+        """End-of-run cleanup: a call whose result event was lost to an
+        abort/error loses its spinner."""
+        for block in self._active_tools.pop(run_key, {}).values():
+            stop = getattr(block, "stop_spinner", None)
+            if callable(stop):
+                stop()
 
     def _record_session_usage(self, usage: Any, role: AgentRole, model_id: str) -> None:
         """Fold one model call's usage into the session totals and the
@@ -446,8 +467,29 @@ class CoreShell(PipelineLayer):
     # -- UI-layer protocol: view stubs (no chat view in task 1) --------------------
 
     def view_task(self, task_id: str) -> None:
+        task = self.manager.tasks.get(task_id)
+        if task is None:
+            # A stale mention link (the task was deleted): a toast beats
+            # a KeyError (the TUI's open_task behaviour).
+            self._hub.emit_notify(
+                f"Task #{task_id} not found.", "drcode", "warning"
+            )
+            return
         self.viewed_id = task_id
-        self._hub.emit_task_updated(task_id, self.manager.tasks[task_id].status.value)
+        # Live blocks are attributed to the viewed task (the host stamps
+        # new blocks with it and mounts them into the open chat view).
+        self._host.current_task_id = task_id
+        self._hub.emit_task_updated(task_id, task.status.value)
+
+    # -- chat-view sinks (plan task 3: the GUI chat pane) -------------------------
+
+    def _chat_at_bottom(self) -> bool:
+        """Is the open chat view tracking the tail? (the pipeline's
+        follow rule — the TUI's chat-timeline method, sink-routed)."""
+        return self._host.stream_sink_at_bottom()
+
+    def _stream_follow(self) -> None:
+        self._host.stream_sink_follow()
 
     def _suggest_conflict_screen(self, task: Task) -> None:
         self._show_event(task, "Merge conflicts parked — open the merge screen.")
