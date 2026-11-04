@@ -156,6 +156,7 @@ class ChatTimelineView(QWidget):
         self._set_empty_hint()
         hub.task_updated.connect(self._on_task_updated)
         hub.service_event.connect(self._on_service_event)
+        hub.task_removed.connect(self._on_task_removed)
 
     # -- public surface ----------------------------------------------------------
 
@@ -229,6 +230,7 @@ class ChatTimelineView(QWidget):
         with contextlib.suppress(RuntimeError):
             self._hub.task_updated.disconnect(self._on_task_updated)
             self._hub.service_event.disconnect(self._on_service_event)
+            self._hub.task_removed.disconnect(self._on_task_removed)
         self.deleteLater()
 
     # -- hub paths ---------------------------------------------------------------
@@ -242,6 +244,13 @@ class ChatTimelineView(QWidget):
         del kind, text
         if task_id == self._task_id:
             self._rebuild_timer.start()
+
+    def _on_task_removed(self, task_id: str) -> None:
+        """The viewed task was deleted: the pane goes empty (the TUI
+        switches to the queue neighbour; here the queue selection change
+        drives the next view_task)."""
+        if task_id == self._task_id:
+            self.clear_view()
 
     # -- rendering ----------------------------------------------------------------
 
@@ -322,8 +331,8 @@ class ChatTimelineView(QWidget):
         block = ChatBlockBrowser()
         block.set_block_html(
             '<table width="100%" cellspacing="0" cellpadding="4">'
-            "<tr><td style=\"background-color:#1d2027; "
-            "border-left:3px solid #3b8eea; padding-left:6px\">"
+            '<tr><td style="background-color:#1d2027; '
+            'border-left:3px solid #3b8eea; padding-left:6px">'
             f"{mention_text_html(text)}</td></tr></table>"
         )
         block.anchor_activated.connect(self._on_anchor)

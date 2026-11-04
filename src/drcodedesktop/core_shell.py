@@ -49,7 +49,7 @@ from drcode.settings import (
     WorktreeRemoval,
 )
 from drcode.task_env import TaskEnvironment
-from drcode.task_manager import TaskManager
+from drcode.task_manager import TaskManager, validate_dependencies
 from drcode.tools import cleanup_orphan_scratches
 from drcode.usage_store import UsageStore, usage_file
 from drcode.workflow import load_hooks
@@ -364,8 +364,7 @@ class CoreShell(PipelineLayer):
 
     def _write_clarification(self, clarification: Clarification) -> None:
         self._hub.append_log(
-            "clarification: "
-            + "; ".join(q.question for q in clarification.questions)
+            "clarification: " + "; ".join(q.question for q in clarification.questions)
         )
         self._host.stream_sink_write_clarification(clarification)
 
@@ -478,9 +477,7 @@ class CoreShell(PipelineLayer):
         if task is None:
             # A stale mention link (the task was deleted): a toast beats
             # a KeyError (the TUI's open_task behaviour).
-            self._hub.emit_notify(
-                f"Task #{task_id} not found.", "drcode", "warning"
-            )
+            self._hub.emit_notify(f"Task #{task_id} not found.", "drcode", "warning")
             return
         self.viewed_id = task_id
         # Live blocks are attributed to the viewed task (the host stamps
@@ -752,6 +749,329 @@ class CoreShell(PipelineLayer):
             return False
         self._nudge_run(task)
         return True
+
+    # -- task management (plan task 5) ----------------------------------------------
+    #
+    # The GUI port of the TUI's task-lifecycle commands
+    # (tui/actions_lifecycle.py): creation, hold/resume, cancel, delete,
+    # dependency editing (the `validate_dependencies` gate) and queue
+    # reordering. The semantics live HERE — the widgets only route to
+    # these methods — so a test drives the exact production path
+    # headless, exactly like the plan-task-4 seam above.
+    #
+    # Shell convention (carried over from submit_user_text): the state
+    # transition ALWAYS happens; the `_advance()` that may START A RUN is
+    # gated on a configured model (without one the queue stays parked —
+    # the task-1 startup rule), while the tester/review halves of the
+    # gate stay model-independent. TUI parity per command is noted in the
+    # docstrings; every refusal is a notify, never an exception.
+
+    @staticmethod
+    def can_edit_dependencies(task: Task | None) -> bool:
+        """Dependencies only make sense before development starts: queued
+        and held tasks — the same statuses the TUI's kind cycle and dep
+        palette accept (``actions_lifecycle._can_edit_dependencies``)."""
+        return task is not None and task.status in (
+            TaskStatus.QUEUED,
+            TaskStatus.HOLD,
+        )
+
+    def create_task(
+        self,
+        text: str,
+        *,
+        kind: TaskKind | None = None,
+        hold: bool = False,
+        depends_on: list[str] | None = None,
+    ) -> Task | None:
+        """Create a task from the new-task form (the fresh-creation half
+        of ``tui.actions_forms._submit_new_form``): the text becomes the
+        condition (the title derives from its first line), `hold` parks
+        the task right away (the editor's "create on hold"), `kind`
+        defaults to the shell's last-used kind (the TUI form's
+        ``new_task_kind``).
+
+        The dependencies are validated BEFORE anything is created (the
+        TUI form's rule: an invalid list keeps the form open with the
+        error shown, nothing is stored) — via the same
+        ``validate_dependencies`` gate the manager itself applies on
+        write; a violation surfaces as a notify and a ``None`` return.
+        The created task is opened in the chat pane and the pipeline is
+        advanced (it starts immediately unless testing is pending, the
+        queue is busy — or the task was created on hold).
+
+        Returns the new task, or None when nothing was created (empty
+        text or a dependency violation)."""
+        stripped = text.strip()
+        if not stripped:
+            self._hub.emit_notify("Task text is empty.", "New task", "warning")
+            return None
+        # Creation-time validation passes task_id=None (self-reference and
+        # cycles are impossible for a task that does not exist yet) — the
+        # same call the TUI form makes; the manager re-validates on write.
+        try:
+            deps = validate_dependencies(self.manager.tasks, None, depends_on or [])
+        except ValueError as e:
+            self._hub.emit_notify(str(e), "New task", "warning")
+            return None
+        task = self.manager.create(
+            "",
+            stripped,
+            kind=kind if kind is not None else self.new_task_kind,
+            hold=hold,
+        )
+        if deps:
+            self.manager.set_dependencies(task.id, deps)
+        self.refresh_sidebar()
+        self.refresh_status()
+        if not hold:
+            # The TUI opens the fresh task in the chat pane (a held one
+            # stays where the user was — it is parked on purpose).
+            self.view_task(task.id)
+        if self.resolved_config(AgentRole.CODING).is_ready:
+            self._advance()
+        return task
+
+    def hold_task(self, task_id: str) -> bool:
+        """Park a task out of the backlog (Ctrl+P in the TUI): queued
+        tasks and tasks awaiting a clarifying answer (the question is
+        preserved and shown again on resume). Returns False (with a
+        notify) for every other status."""
+        task = self.manager.tasks.get(task_id)
+        if task is None:
+            self._hub.emit_notify(f"Task #{task_id} not found.", "Hold task", "warning")
+            return False
+        if task.status not in (
+            TaskStatus.QUEUED,
+            TaskStatus.AWAITING_CLARIFICATION,
+        ):
+            self._hub.emit_notify(
+                "Only a queued task (or one awaiting clarification) can be "
+                "put on hold.",
+                "Hold task",
+                "warning",
+            )
+            return False
+        self.manager.set_hold(task.id, on=True)
+        self.refresh_sidebar()
+        self.refresh_status()
+        if self.viewed_id == task.id:
+            self.refresh_task_status()
+        return True
+
+    def resume_task(self, task_id: str) -> bool:
+        """Return a held task to where it was (queued, or awaiting its
+        clarification; an answer typed while held re-queues it at the
+        head — the manager's rule). The pipeline is advanced: a resumed
+        task may be picked up right away."""
+        task = self.manager.tasks.get(task_id)
+        if task is None:
+            self._hub.emit_notify(
+                f"Task #{task_id} not found.", "Resume task", "warning"
+            )
+            return False
+        if task.status is not TaskStatus.HOLD:
+            self._hub.emit_notify(
+                "Only a held task can be resumed.", "Resume task", "warning"
+            )
+            return False
+        self.manager.set_hold(task.id, on=False)
+        if self.resolved_config(AgentRole.CODING).is_ready:
+            self._advance()
+        self.refresh_sidebar()
+        self.refresh_status()
+        if self.viewed_id == task.id:
+            self.refresh_task_status()
+        return True
+
+    def cancel_task(self, task_id: str) -> bool:
+        """User cancels the task (``actions_lifecycle.action_cancel_task``):
+        its runs are stopped, all queued input is dropped and the task
+        completes immediately — the tester never runs, the worktree
+        environment is torn down by the removal listeners.
+
+        Refused for a COMPLETED task (nothing left to cancel). The
+        cancelled run's in-flight prompt is flushed into the transcript
+        first, exactly like in the TUI — a brief consumed by a run that
+        had no node boundary yet must not vanish from the history."""
+        task = self.manager.tasks.get(task_id)
+        if task is None:
+            self._hub.emit_notify(
+                f"Task #{task_id} not found.", "Cancel task", "warning"
+            )
+            return False
+        if task.status is TaskStatus.COMPLETED:
+            self._hub.emit_notify(
+                "The task is already completed — cancel is for unfinished work.",
+                "Cancel task",
+                "warning",
+            )
+            return False
+        stopped_run = False
+        # Stop only this task's agent run (parallel slots: the other
+        # tasks' runs are independent and keep going).
+        if task.id in self._agent_runs:
+            self._host.cancel_worker_group(f"agent-{task.id}")
+            self._agent_runs.pop(task.id, None)
+            self._current_tool[task.id] = None
+            stopped_run = True
+        if self.tester_running and self._tester_task_id == task.id:
+            self._host.cancel_worker_group("tester")
+            self.tester_running = False
+            self._current_tool[task.id] = None
+            stopped_run = True
+        had_pending = bool(task.pending_input)
+        self._flush_in_flight_prompt(task)
+        self.manager.cancel(task.id)
+        # The task was possibly in TESTING: drop its tester pipeline
+        # state — with a live tester run this is done by the cancelled
+        # worker's `finally`, without one the stale backoff/retry entries
+        # and the stale `_tester_task_id` would linger until restart.
+        self._tester_resume_round.discard(task.id)
+        self._tester_compaction_resumed.discard(task.id)
+        self._tester_compaction_verdict.discard(task.id)
+        self._tester_fail_count.pop(task.id, None)
+        self._tester_retry_at.pop(task.id, None)
+        self._tester_net_count.pop(task.id, None)
+        if self._tester_task_id == task.id and not self.tester_running:
+            self._tester_task_id = None
+        if stopped_run:
+            self._clear_stream_label()
+        self._show_event(
+            task,
+            "Task cancelled by the user — removed from the pipeline without testing.",
+        )
+        self.refresh_sidebar()
+        self.refresh_status()
+        if self.resolved_config(AgentRole.CODING).is_ready:
+            self._advance()
+        del had_pending  # the chat pane rebuilds from the transcript
+        return True
+
+    def delete_task(self, task_id: str) -> bool:
+        """Fully remove the task — from the shell and from the project
+        storage (``.drcode/tasks/<id>.json``).
+
+        GUI rule (this task's spec): only a HELD task is deletable — a
+        parked task has nothing running for it, so no worker state is
+        left behind. Everything else (QUEUED/ACTIVE/TESTING/…/DRAFT/
+        COMPLETED) is refused with a notify."""
+        task = self.manager.tasks.get(task_id)
+        if task is None:
+            self._hub.emit_notify(
+                f"Task #{task_id} not found.", "Delete task", "warning"
+            )
+            return False
+        if task.status is not TaskStatus.HOLD:
+            self._hub.emit_notify(
+                "Only a held task can be deleted — put the task on hold "
+                "first (queued, active and completed tasks are kept).",
+                "Delete task",
+                "warning",
+            )
+            return False
+        was_viewed = self.viewed_id == task.id
+        self.manager.delete(task.id)
+        if was_viewed:
+            # The chat pane showed the deleted task: drop the selection
+            # (and any pending render bookkeeping — its "user-pending"
+            # lines must never leak into another task's transcript).
+            self.viewed_id = None
+            self._host.current_task_id = ""
+            self._chat_has_content = False
+            self._pending_rendered = []
+            self._chat_epoch += 1
+            self._rendered_clarification = None
+        self._hub.emit_task_removed(task_id)
+        self.refresh_sidebar()
+        self.refresh_status()
+        return True
+
+    def add_dependency(self, task_id: str, dep_id: str) -> bool:
+        """Make the task wait for `dep_id` (COMPLETED + merged) before it
+        can be taken into development (``action_add_dependency``). The
+        `validate_dependencies` gate runs inside the manager: an unknown
+        id, a self-reference or a cycle raise, and the message is
+        surfaced as a notify with the deps left untouched."""
+        task = self.manager.tasks.get(task_id)
+        if not self.can_edit_dependencies(task) or task is None:
+            self._hub.emit_notify(
+                "Dependencies are editable for queued and held tasks only.",
+                "Dependencies",
+                "warning",
+            )
+            return False
+        dep = self._normalize_dep_id(dep_id)
+        if not dep:
+            self._hub.emit_notify("Dependency id is empty.", "Dependencies", "warning")
+            return False
+        try:
+            self.manager.set_dependencies(task.id, [*task.depends_on, dep])
+        except ValueError as e:
+            self._hub.emit_notify(str(e), "Dependencies", "warning")
+            return False
+        self._show_event(task, f"Dependency #{dep} added — task waits for it.")
+        self.refresh_sidebar()
+        self.refresh_status()
+        if self.viewed_id == task.id:
+            self.refresh_task_status()
+        return True
+
+    def remove_dependency(self, task_id: str, dep_id: str) -> bool:
+        """Drop one dependency from the task (``action_remove_dependency``).
+        Doubles as the force-start: removing the blocking dependency makes
+        the task eligible immediately (the gate is dynamic — nothing else
+        to reset), the manual override is logged into the task's service
+        events and the pipeline is advanced."""
+        task = self.manager.tasks.get(task_id)
+        if not self.can_edit_dependencies(task) or task is None:
+            self._hub.emit_notify(
+                "Dependencies are editable for queued and held tasks only.",
+                "Dependencies",
+                "warning",
+            )
+            return False
+        dep = self._normalize_dep_id(dep_id)
+        if dep not in task.depends_on:
+            return False
+        self.manager.set_dependencies(task.id, [d for d in task.depends_on if d != dep])
+        self._dep_block_notified.discard(task.id)
+        self._dep_gate.pop(task.id, None)
+        self._show_event(
+            task,
+            f"Manual override: dependency #{dep} removed — "
+            "task eligible for development.",
+        )
+        self.refresh_sidebar()
+        self.refresh_status()
+        if self.viewed_id == task.id:
+            self.refresh_task_status()
+        if self.resolved_config(AgentRole.CODING).is_ready:
+            self._advance()
+        return True
+
+    def move_task_in_queue(self, task_id: str, *, up: bool) -> bool:
+        """Move a queued task one step in the backlog (the TUI's
+        Ctrl+Up/Ctrl+Down): ``up`` moves it away from execution, down —
+        closer. The manager refuses moves that cross the bug block (bug
+        reports always run first) or leave the queue; a refusal is a
+        quiet False (the view disables the actions at the edges)."""
+        task = self.manager.tasks.get(task_id)
+        if task is None or task.status is not TaskStatus.QUEUED:
+            return False
+        if self.manager.move_in_queue(task.id, up=up) is None:
+            return False
+        self.refresh_sidebar()
+        self.refresh_status()
+        if self.viewed_id == task.id:
+            self.refresh_task_status()
+        return True
+
+    @staticmethod
+    def _normalize_dep_id(raw: str) -> str:
+        """The dependency field's id normalisation: surrounding
+        whitespace off, a leading ``#`` (the mention-link form) off."""
+        return raw.strip().lstrip("#")
 
     # -- worktree listeners (adapted from tui/app.py) -----------------------------
 

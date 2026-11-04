@@ -42,6 +42,10 @@ class EventHub(QObject):
     #: A toast-worthy notification (message, title, severity).
     notify = Signal(str, str, str)
 
+    #: A task was deleted entirely (storage + memory) — the queue model
+    #: and the open chat pane drop their rows/views for it. Carries the id.
+    task_removed = Signal(str)
+
     #: A diagnostics line from the host log.
     host_log = Signal(str)
 
@@ -79,6 +83,10 @@ class EventHub(QObject):
     def emit_service_event(self, task_id: str, kind: str, text: str) -> None:
         self.append_log(f"service_event {task_id} [{kind}] {text}")
         self.service_event.emit(task_id, kind, text)
+
+    def emit_task_removed(self, task_id: str) -> None:
+        self.append_log(f"task_removed {task_id}")
+        self.task_removed.emit(task_id)
 
     def emit_notify(self, message: str, title: str, severity: str) -> None:
         self.append_log(f"notify [{severity}] {title}: {message}")

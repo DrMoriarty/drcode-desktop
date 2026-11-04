@@ -165,7 +165,10 @@ class TaskQueueModel(QObject):
         # the hub signal (CoreShell's status listener); the shell's
         # refresh_sidebar broadcasts a coarse all-tasks snapshot on the
         # pipeline's non-status reshuffles (promotions, queue moves).
+        # A deletion fires task_removed — no task_updated exists for a
+        # task that is no longer there.
         hub.task_updated.connect(self._on_task_updated)
+        hub.task_removed.connect(self._on_task_removed)
 
     # -- public surface --------------------------------------------------------
 
@@ -240,6 +243,7 @@ class TaskQueueModel(QObject):
         fire into a dead shell afterwards."""
         with contextlib.suppress(RuntimeError):
             self._hub.task_updated.disconnect(self._on_task_updated)
+            self._hub.task_removed.disconnect(self._on_task_removed)
 
     def sync_task(self, task_id: str) -> None:
         """The event path: a ``task_updated`` for `task_id` arrived —
@@ -258,6 +262,10 @@ class TaskQueueModel(QObject):
     def _on_task_updated(self, task_id: str, status: str) -> None:
         del status
         self.sync_task(task_id)
+
+    def _on_task_removed(self, task_id: str) -> None:
+        del task_id  # the fingerprint covers every task at once
+        self.refresh()
 
     def _compute_fingerprint(self) -> tuple:
         """Everything the rows render — the GUI port of the TUI sidebar's
@@ -296,11 +304,7 @@ class TaskQueueModel(QObject):
     def _row_for(self, task: Task) -> TaskRow:
         shell = self._shell
         resolving = shell._resolver_running and shell._resolver_task_id == task.id
-        marker = (
-            "⚙"
-            if resolving
-            else STATUS_MARKERS.get(task.status.value, "⏳")
-        )
+        marker = "⚙" if resolving else STATUS_MARKERS.get(task.status.value, "⏳")
         kind_letter = KIND_LETTERS[task.kind]
         if task.verification is VerificationStatus.PASSED:
             verification, glyph = task.verification.value, "✅"
