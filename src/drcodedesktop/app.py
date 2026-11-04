@@ -22,7 +22,9 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QTabWidget,
     QToolBar,
+    QWidget,
 )
 from qasync import QEventLoop
 
@@ -30,6 +32,7 @@ from .core_shell import CoreShell
 from .event_hub import EventHub, log_path_for
 from .gui_config import GuiConfig
 from .qt_host import QtHost
+from .task_queue_view import TaskQueueView
 
 
 class MainWindow(QMainWindow):
@@ -43,9 +46,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("DrCode Desktop")
         self.resize(1000, 640)
 
+        # The console keeps every raw core event; the queue tab (task 2)
+        # renders the live task list above it.
         self._console = QPlainTextEdit(readOnly=True)
         self._console.setMaximumBlockCount(5000)
-        self.setCentralWidget(self._console)
+        self._tabs = QTabWidget()
+        self._tabs.addTab(QWidget(), "Queue")  # replaced per project
+        self._tabs.addTab(self._console, "Console")
+        self._queue_view: TaskQueueView | None = None
+        self.setCentralWidget(self._tabs)
 
         toolbar = QToolBar("main")
         self.addToolBar(toolbar)
@@ -82,6 +91,7 @@ class MainWindow(QMainWindow):
 
         self._host = QtHost(self._hub)
         self._shell = CoreShell(project_root, self._host, self._hub)
+        self._install_queue_view()
         self._config.remember_project(project_root)
         self._fill_recents_menu()
         self._model_label.setText(project_root.name)
@@ -94,12 +104,26 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._start_shell)
 
     def close_project(self) -> None:
+        if self._queue_view is not None:
+            self._queue_view.shutdown()
+            self._tabs.removeTab(self._tabs.indexOf(self._queue_view))
+            self._queue_view.deleteLater()
+            self._queue_view = None
+            self._tabs.insertTab(0, QWidget(), "Queue")
         if self._shell is not None:
             self._shell.shutdown()
             self._shell = None
         self._host = None
         self._hub = None
         self._model_label.setText("no project")
+
+    def _install_queue_view(self) -> None:
+        """The queue screen of the freshly opened project (its model
+        subscribes to the new hub; the placeholder tab is swapped out)."""
+        assert self._shell is not None and self._hub is not None
+        self._queue_view = TaskQueueView(self._shell, self._hub)
+        self._tabs.removeTab(0)
+        self._tabs.insertTab(0, self._queue_view, "Queue")
 
     def _start_shell(self) -> None:
         if self._shell is not None:
