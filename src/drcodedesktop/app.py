@@ -13,7 +13,7 @@ import asyncio
 import sys
 from pathlib import Path
 
-from PySide6.QtGui import QAction, QCloseEvent
+from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -33,7 +33,9 @@ from .chat_view import ChatTimelineView
 from .core_shell import CoreShell
 from .event_hub import EventHub, log_path_for
 from .gui_config import GuiConfig
+from .model_settings_dialog import ModelSettingsDialog
 from .qt_host import QtHost
+from .settings_dialog import ProjectSettingsDialog
 from .task_queue_view import TaskQueueView
 
 
@@ -73,6 +75,21 @@ class MainWindow(QMainWindow):
         self._recents_menu = QMenu(self)
         self._fill_recents_menu()
 
+        # The Settings menu (plan task 6): project settings and per-role
+        # model selection — both dialogs write the very config files the
+        # TUI writes, so GUI and TUI stay interchangeable on one project.
+        settings_menu = QMenu("&Settings", self.menuBar())
+        self._settings_project_action = QAction("Project settings…", self)
+        self._settings_project_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self._settings_project_action.triggered.connect(self._open_project_settings)
+        self._settings_models_action = QAction("&Models…", self)
+        self._settings_models_action.triggered.connect(self._open_model_settings)
+        settings_menu.addAction(self._settings_project_action)
+        settings_menu.addAction(self._settings_models_action)
+        self.menuBar().addMenu(settings_menu)
+        self._settings_project_action.setEnabled(False)
+        self._settings_models_action.setEnabled(False)
+
     # -- project lifecycle ----------------------------------------------------
 
     def open_project(self, project_root: Path) -> None:
@@ -99,6 +116,8 @@ class MainWindow(QMainWindow):
         self._fill_recents_menu()
         self._model_label.setText(project_root.name)
         self.setWindowTitle(f"DrCode Desktop — {project_root.name}")
+        self._settings_project_action.setEnabled(True)
+        self._settings_models_action.setEnabled(True)
         self._console_append(f"=== project: {project_root} ===")
         self._console_append(f"log file: {log_path_for(project_root)}")
         # Start once the event loop is running (workers/timers need it).
@@ -127,6 +146,8 @@ class MainWindow(QMainWindow):
         self._host = None
         self._hub = None
         self._model_label.setText("no project")
+        self._settings_project_action.setEnabled(False)
+        self._settings_models_action.setEnabled(False)
 
     def _install_queue_view(self) -> None:
         """The queue screen of the freshly opened project (its model
@@ -168,6 +189,20 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     # -- pickers ---------------------------------------------------------------
+
+    def _open_project_settings(self) -> None:
+        """Settings → "Project settings…": the modal form over the
+        project's .drcode/settings.json (the TUI's Task-settings
+        dialog twin). Nothing persists until the dialog's Apply."""
+        if self._shell is not None:
+            ProjectSettingsDialog(self._shell, self).exec()
+
+    def _open_model_settings(self) -> None:
+        """Settings → "Models…": the per-role model selection /
+        max_tokens form over the user catalog and the project's
+        drcode.json (the TUI's Project-model-settings twin)."""
+        if self._shell is not None:
+            ModelSettingsDialog(self._shell, self).exec()
 
     def _pick_project(self) -> None:
         start = self._config.last or str(Path.home())

@@ -186,3 +186,34 @@ LLM-слой (`merge_resolver.py`) НЕ портируется — он оста
 (решения по хункам, стейджинг, finish/abort); контракт «drcode никогда не
 мержит в пользовательский checkout» не нарушен; тесты на парсинг и
 finish/abort через GUI-модель.
+
+## Задача 10. Редактор каталога провайдеров
+
+**Зависимости:** задача 6 (вынесена из неё осознанно: экран выбора моделей
+по ролям читает каталог, но его CRUD-редактор — отдельный экран; в
+формулировку задачи 6 не входил).
+
+Порт редактора пользовательского каталога моделей (`~/.config/drcode/models.json`):
+образец — `tui/model_setup_app.py` (`ModelCatalogScreen`, mounted как
+«Provider catalog…» в Settings TUI).
+
+- CRUD провайдеров (имя без `/`, base_url, api_key, кешированный
+  health_check_url) и их моделей (`ModelEntry`: id, max_context_tokens,
+  max_tokens, compaction_threshold) — через `UserModelsStore` с его
+  `.bak`-фолбэком и атомарной записью; пишется ровно тот models.json,
+  что пишет TUI (взаимозаменяемость GUI↔TUI на одной машине);
+  защита `UserModelsStore.save` от записи в реальный каталог под
+  `DRCODE_TASK_ID` сохраняется как есть;
+- pre-fill из legacy-данных (`providers.load_seeded_catalog`): когда
+  models.json ещё не существует, экран заполняется из пользовательского
+  drcode.json и project-овых `custom_models` — in-memory, до явного Save;
+- опционально — автообнаружение моделей эндпоинта
+  (`agent_model.fetch_models`) и health-check probe (как в TUI-экране);
+- запись только по явному Save (ESC/Cancel ничего не пишет — семантика
+  TUI-экрана); после сохранения GUI-диалог задачи 6 подхватывает новый
+  каталог (кэш резолюций сбрасывается).
+
+**Критерии приёмки:** изменения пишутся в `models.json` в формате TUI
+(бэкап `.bak` preserved); тесты на pre-fill из legacy-данных, атомарную
+запись/бэкап и подхват каталога экраном выбора после Save; зелёный
+`uv run pytest -n 4`, чистые ruff + pyright, TUI нетронут.

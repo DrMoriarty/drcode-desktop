@@ -39,9 +39,15 @@ from drcode.models import (
 from drcode.notifications import Notifier
 from drcode.providers import (
     AgentRole,
+    CustomModelEntry,
+    ModelRef,
+    load_project_model_slots,
     migrate_project_config,
     migrate_user_config,
     project_has_model_selection,
+    set_project_custom_active,
+    set_project_custom_model,
+    set_project_model,
 )
 from drcode.settings import (
     ProjectSettings,
@@ -1072,6 +1078,87 @@ class CoreShell(PipelineLayer):
         """The dependency field's id normalisation: surrounding
         whitespace off, a leading ``#`` (the mention-link form) off."""
         return raw.strip().lstrip("#")
+
+    # -- settings / model-selection seams (plan task 6) -----------------------------
+
+    def apply_task_settings(self, draft: ProjectSettings) -> None:
+        """Apply an accepted project-settings draft ATOMICALLY — the GUI
+        twin of ``tui.actions_settings.action_apply_task_settings``: the
+        draft is merged into the LIVE settings object in place
+        (TaskEnvironment holds the same instance), persisted once, and the
+        same side effects as the TUI's per-field actions are replayed
+        (pipeline gate + keep-awake re-evaluation)."""
+        from .settings_dialog import copy_task_settings
+
+        copy_task_settings(self.settings, draft)
+        self.settings_store.save(self.settings)
+        self._hub.emit_notify(
+            "Task settings applied", "Project settings", "information"
+        )
+        self._advance()
+        self._update_keepawake()
+
+    def apply_model_settings(
+        self,
+        slots: dict[AgentRole, ModelRef | str | None],
+        customs: dict[AgentRole, CustomModelEntry],
+        role_max_tokens: dict[AgentRole, int],
+    ) -> None:
+        """Persist the per-role model selection and max_tokens overrides —
+        the GUI twin of ``tui.actions_models._project_model_settings_done``:
+        the same three config layers, in the same order and with the same
+        merge semantics as the TUI (so both front-ends stay interchangeable
+        on one project):
+
+        - new/changed custom models first (``set_project_custom_model``
+          stores the entry AND activates it — ``models[role] = "custom"``);
+        - the remaining slots (a catalog reference, a re-activation of a
+          saved custom model, or None = "User default"), skipping the ones
+          already written by the custom-model pass or left untouched;
+        - the ``role_max_tokens`` overrides merged against the STORED
+          settings file (the live object may predate an external edit).
+
+        Then the per-role resolution cache is dropped and the pipeline
+        gate re-run — a newly configured model starts the parked queue.
+        """
+        for role, entry in customs.items():
+            set_project_custom_model(self.project_root, role, entry)
+        current_slots = load_project_model_slots(self.project_root)
+        for role, slot in slots.items():
+            if role in customs or slot == current_slots.get(role):
+                continue  # already activated / untouched
+            if isinstance(slot, ModelRef):
+                set_project_model(self.project_root, role, slot)
+            elif slot == "custom":
+                set_project_custom_active(self.project_root, role)
+            else:
+                set_project_model(self.project_root, role, None)
+        stored = dict(self.settings_store.load().role_max_tokens)
+        merged = dict(stored)
+        for role in AgentRole:
+            merged.pop(role.value, None)
+        for role, value in role_max_tokens.items():
+            merged[role.value] = value
+        self.settings.role_max_tokens = merged
+        if merged != stored:
+            self.settings_store.save(self.settings)
+        self.invalidate_resolved_configs()
+        self.refresh_status()
+        self._advance()
+        overrides = (
+            ", ".join(
+                f"{role.value}={value}"
+                for role, value in sorted(
+                    role_max_tokens.items(), key=lambda kv: kv[0].value
+                )
+            )
+            or "no max_tokens overrides"
+        )
+        self._hub.emit_notify(
+            f"Project model settings applied ({overrides})",
+            "Project model settings",
+            "information",
+        )
 
     # -- worktree listeners (adapted from tui/app.py) -----------------------------
 
