@@ -158,6 +158,36 @@ def test_created_dependent_waits_for_its_dependency(
     state = mocks.scripted_model(monkeypatch)
     state.steps = [mocks.text_response("done a"), mocks.text_response("done b")]
 
+    # Deterministic snapshot: the FIRST scripted step is held open until
+    # the test releases it — the model call is recorded, but a's run
+    # stays provably in flight, so the ACTIVE/QUEUED snapshot below is
+    # taken INSIDE the run, never inside a wall-clock window (waiting
+    # for `len(state.calls) == 1` raced the run itself: under the fast
+    # mock a's whole run could complete within one wait_until poll —
+    # and with both calls already recorded the predicate could never
+    # turn true again, hanging out the timeout).
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_stream(
+        messages: list[Any], info: AgentInfo
+    ) -> AsyncIterator[str | dict[int, Any]]:
+        del info
+        state.calls.append(mocks.last_user_text(messages))
+        step = state.steps.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        if not started.is_set():
+            started.set()
+            await release.wait()
+        for part in step.parts:
+            if isinstance(part, TextPart):
+                yield part.content
+
+    monkeypatch.setattr(
+        state, "model", lambda: FunctionModel(state.fn, stream_function=gated_stream)
+    )
+
     async def scenario(shell: CoreShell, hub: EventHub) -> None:
         del hub
         no_verification(shell)
@@ -168,15 +198,16 @@ def test_created_dependent_waits_for_its_dependency(
         assert b.depends_on == [a.id]
         # a is taken into development while b waits queued: the gate
         # held the dependent back (the promotion worker never skipped
-        # the dep check under the GUI's own create→advance path).
-        try:
-            await mocks.wait_until(lambda: len(state.calls) == 1, what="a's run")
-        except AssertionError:
-            print("EVENTS a:", [e.text for e in a.events])
-            print("STATUS a:", a.status, "b:", b.status)
-            raise
+        # the dep check under the GUI's own create→advance path). The
+        # gated model call guarantees a's run is in flight here —
+        # promotion to ACTIVE happened before the run was dispatched,
+        # and b cannot be promoted while a is incomplete.
+        await mocks.wait_until(started.is_set, what="a's run start")
+        assert len(state.calls) == 1
         assert a.status is TaskStatus.ACTIVE
         assert b.status is TaskStatus.QUEUED
+        # Release the held step: a completes, the dep gate unblocks b.
+        release.set()
         await wait_status(shell, a.id, TaskStatus.COMPLETED)
         await wait_status(shell, b.id, TaskStatus.COMPLETED)
         # The gate ordered the runs: the model saw a's brief first.
