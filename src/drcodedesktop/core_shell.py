@@ -18,9 +18,11 @@ import contextlib
 import threading
 import time
 from collections import deque
+from functools import partial
 from pathlib import Path
 from typing import Any
 
+from drcode.agent import is_pending_retry
 from drcode.config import Config
 from drcode.core.pipeline import PipelineLayer
 from drcode.core.usage import SessionTokenUsage
@@ -350,7 +352,12 @@ class CoreShell(PipelineLayer):
         """A live history write of a running pipeline (a consumed prompt
         entering the view, a testing/resolving separator): forwarded to
         the open chat view (the persisted transcript covers it at the
-        next rebuild)."""
+        next rebuild). A queued-message pre-draw ("user-pending") also
+        registers the text in ``_pending_rendered`` — exactly what the
+        TUI's chat timeline does on the same write — so the consuming
+        run's node-boundary draw skips it and the bubble shows once."""
+        if role == "user-pending" and text not in self._pending_rendered:
+            self._pending_rendered.append(text)
         self._hub.append_log(f"history {role}: {text!r}")
         self._host.stream_sink_write_line(role, text, at)
         return None
@@ -498,6 +505,253 @@ class CoreShell(PipelineLayer):
         # Full git-based parity is task-7 work; the skeleton reports
         # nothing unmerged (this only gates a reminder message).
         return []
+
+    # -- user input / run control (plan task 4) ------------------------------------
+    #
+    # The GUI port of the TUI's user actions over a running task:
+    # tui/actions_lifecycle._submit_user_text (the chat input submit),
+    # _abort_active_runs (the confirmed ESC stop) and
+    # tui/activity_view._nudge_run (Ctrl+R). The semantics live here, in
+    # the shell — the widgets only route to these methods — so a test
+    # can drive the exact production path headless.
+
+    def submit_user_text(self, task_id: str, text: str) -> bool:
+        """Queue a user message into the task and move the pipeline.
+
+        The port of ``tui.actions_lifecycle._submit_user_text``: the text
+        goes through ``manager.send`` (pending_input accumulation, the
+        duplicate re-send guard, the clarification-answer re-queue with
+        ``queue_head``, the completed/testing re-entry) — then, as in the
+        TUI, an ACTIVE task's in-flight run is superseded by a fresh one
+        (the exclusive ``agent-<id>`` group re-queues the interrupted
+        attempt's message) and every other status re-enters ``_advance()``
+        (promotion → ``run_agent``; an unfinished attempt resumes as a
+        continuation turn, a queued batch is consumed as ONE prompt).
+
+        Returns True when the message was accepted (False: unknown task,
+        a draft, empty text, or a duplicate of something still queued /
+        already in flight). The run start is gated on a configured model
+        like every other shell entry point — the message itself is always
+        recorded, exactly as in the TUI's no-model state.
+        """
+        task = self.manager.tasks.get(task_id)
+        if task is None:
+            self._hub.emit_notify(f"Task #{task_id} not found.", "drcode", "warning")
+            return False
+        if task.status is TaskStatus.DRAFT:
+            # A draft never takes chat input (belt-and-braces, same as
+            # the TUI: its text is composed in the task editor).
+            self._hub.emit_notify(
+                "A draft is composed in the task editor, not the chat.",
+                "drcode",
+                "warning",
+            )
+            return False
+        stripped = text.strip()
+        if not stripped:
+            return False
+        # A re-send of a text that is still queued (an identical entry
+        # sits in pending_input) or already in flight (the transcript
+        # holds it as the prompt of the unfinished attempt) is a no-op:
+        # send() ignores it, and drawing/promoting it again would show
+        # the comment twice.
+        if any(e.text == stripped for e in task.pending_input) or is_pending_retry(
+            task.messages, stripped
+        ):
+            return False
+        # Capture the pre-run state: _advance() promotes the task to
+        # ACTIVE (promote_next) and flips its status, so the pre-draw
+        # decision below must use the ORIGINAL status.
+        was_active = task.status is TaskStatus.ACTIVE
+        self.manager.send(task_id, stripped)
+        if not was_active and self.viewed_id == task_id:
+            # Draw the queued message BEFORE advancing: the promoted run
+            # consumes pending_input as its first step and would draw the
+            # "user" block itself (registering the text in
+            # _pending_rendered makes that draw skip it — see
+            # _write_history_line). A rebuild re-renders the entry from
+            # the timeline once, whichever side of the consumption window
+            # it lands on.
+            self._write_history_line("user-pending", stripped)
+        if was_active:
+            # A comment to the running task interrupts it: the exclusive
+            # "agent-<id>" group cancels the in-flight run (its message
+            # goes back to pending_input) and the new run resumes with
+            # the comment.
+            self._clear_stream_label()
+            self.run_agent(task_id)
+        elif self.resolved_config(AgentRole.CODING).is_ready:
+            # Queued/clarification/... input: advance the pipeline —
+            # testing backlog first, then the queue. (The TUI advances
+            # unconditionally; the shell's other entry points gate the
+            # RUN start on a configured model, and a run that is
+            # guaranteed to fail on model construction is not semantics
+            # worth reproducing — the send() state transition above
+            # already happened.)
+            self._advance()
+        self.refresh_sidebar()
+        self.refresh_status()
+        return True
+
+    def _clear_stream_label(self) -> None:
+        """The TUI's stream-label teardown, on the sink seam: finish the
+        open chat view's live blocks (spinner off, tail flushed) — an
+        aborted/superseded run must not leave a spinning block behind."""
+        self._host.stream_sink_stop_streaming()
+
+    def stop_viewed_run(self) -> bool:
+        """The actual stop — the port of
+        ``tui.actions_lifecycle._abort_active_runs`` (what a confirmed
+        ESC fires). With a single development slot (the default, or
+        parallelism without worktree isolation) this is the historical
+        global stop: whatever run is alive. With parallel slots it stops
+        ONLY the currently viewed task's run. Every aborted run is
+        marked ``unfinished`` (the resume flag the promotion and the
+        continuation turn read) and leaves a service event in its chat,
+        so the stop is never silent.
+
+        Returns True when something was actually stopped."""
+        stopped_tasks: list[Task] = []
+        if self.parallel_limit <= 1:
+            if not (self.agent_running or self.tester_running):
+                return False
+            stopped_tasks = [
+                self.manager.get(tid)
+                for tid in list(self._agent_runs)
+                if tid in self.manager.tasks
+            ]
+            for group in [f"agent-{tid}" for tid in list(self._agent_runs)]:
+                self._host.cancel_worker_group(group)
+            if self.tester_running:
+                self._host.cancel_worker_group("tester")
+                if (
+                    self._tester_task_id is not None
+                    and self._tester_task_id in self.manager.tasks
+                ):
+                    stopped_tasks.append(self.manager.get(self._tester_task_id))
+            self._agent_runs.clear()
+            self.tester_running = False
+            self._current_tool.clear()
+            self._clear_stream_label()
+            self.refresh_status()
+        else:
+            task = self.manager.tasks.get(self.viewed_id or "")
+            if task is None:
+                self._hub.emit_notify(
+                    "Task is not running — select an active task to stop one",
+                    "Stop run",
+                    "warning",
+                )
+                return False
+            stopped = False
+            if task.id in self._agent_runs:
+                self._host.cancel_worker_group(f"agent-{task.id}")
+                self._agent_runs.pop(task.id, None)
+                self._current_tool[task.id] = None
+                stopped = True
+                stopped_tasks.append(task)
+            if self.tester_running and self._tester_task_id == task.id:
+                self._host.cancel_worker_group("tester")
+                self.tester_running = False
+                self._current_tool[task.id] = None
+                stopped = True
+                stopped_tasks.append(task)
+            if not stopped:
+                self._hub.emit_notify(
+                    "Task is not running — select an active task to stop one",
+                    "Stop run",
+                    "warning",
+                )
+                return False
+            self._clear_stream_label()
+            self.refresh_status()
+        # The stop is explicit and shows the way back: the unfinished
+        # mark makes promotion (and Ctrl+R / any new input) resume the
+        # interrupted attempt as a continuation turn.
+        for stopped in stopped_tasks:
+            if stopped.status is TaskStatus.ACTIVE and not stopped.unfinished:
+                # Mark HERE, not only in the run's CancelledError handler:
+                # the worker may be cancelled before its first step — the
+                # handler then never runs. Idempotent with the handler's
+                # own marking.
+                stopped.unfinished = True
+                stopped.touch()
+                self.manager.storage.save(stopped)
+            self._show_event(
+                stopped,
+                "Run aborted by user (ESC) — press Ctrl+R to resume.",
+            )
+        self._hub.emit_notify(
+            "Run stopped · Ctrl+R to resume", "Stop run", "information"
+        )
+        return True
+
+    #: How long a nudge waits before restarting the aborted run (the
+    #: TUI's activity-view constant: the cancellation must settle first).
+    _NUDGE_RESTART_DELAY = 1.0
+
+    def _nudge_run(self, task: Task) -> None:
+        """Abort the hung/stalled run for `task` (if one is in flight)
+        and schedule its restart — the port of
+        ``tui.activity_view._nudge_run`` (Ctrl+R, and the same move the
+        stall watchdog makes automatically). The agent resumes via a
+        continuation turn (no text is re-sent — ``task.unfinished``
+        marks the interrupted attempt); a TESTING task gets a fresh
+        verification round via the pipeline gate."""
+        if task.status is TaskStatus.ACTIVE:
+            if task.id in self._agent_runs:
+                self._host.cancel_worker_group(f"agent-{task.id}")
+                self._agent_runs.pop(task.id, None)
+                self._current_tool[task.id] = None
+                self._clear_stream_label()
+                self.refresh_status()
+            self._schedule_pipeline_timer(
+                self._NUDGE_RESTART_DELAY, partial(self.run_agent, task.id)
+            )
+        elif task.status is TaskStatus.TESTING:
+            if self.tester_running:
+                self._host.cancel_worker_group("tester")
+                self.tester_running = False
+                self._current_tool[task.id] = None
+                self.refresh_status()
+            self._schedule_pipeline_timer(self._NUDGE_RESTART_DELAY, self._advance)
+        elif self.tester_running and self._tester_task_id == task.id:
+            # The run hung AFTER its useful work: the status already
+            # moved on mid-run, but the hung tester worker keeps
+            # tester_running True and blocks the whole pipeline — abort
+            # it and re-advance.
+            self._host.cancel_worker_group("tester")
+            self.tester_running = False
+            self._current_tool[task.id] = None
+            self.refresh_status()
+            self._schedule_pipeline_timer(self._NUDGE_RESTART_DELAY, self._advance)
+        elif self._resolver_running and self._resolver_task_id == task.id:
+            # A hung conflict-resolver round: abort and restart the round
+            # (the transcript is kept; the round resumes as a
+            # continuation turn).
+            self._host.cancel_worker_group("resolver")
+            self._resolver_running = False
+            self._resolver_task_id = None
+            self._current_tool[task.id] = None
+            self.refresh_status()
+            self._schedule_pipeline_timer(
+                self._NUDGE_RESTART_DELAY, partial(self.run_resolver, task.id)
+            )
+        self.refresh_sidebar()
+
+    def resume_viewed_run(self) -> bool:
+        """Ctrl+R on the viewed task: abort its hung or stalled run and
+        restart it — the one-action resume for a task left "active,
+        nothing running" by a stop (ESC). Returns False when nothing is
+        viewed."""
+        task = self.manager.tasks.get(self.viewed_id or "")
+        if task is None:
+            self._hub.emit_notify(
+                "Open a task to resume its run.", "Resume run", "warning"
+            )
+            return False
+        self._nudge_run(task)
+        return True
 
     # -- worktree listeners (adapted from tui/app.py) -----------------------------
 

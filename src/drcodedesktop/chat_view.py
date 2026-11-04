@@ -18,6 +18,12 @@ TUI's chat log. Interactive parity the pane carries now:
 Updates ride the hub: ``task_updated``/``service_event`` for the viewed
 task trigger a debounced rebuild (the node boundaries persist the
 transcript, then the timeline covers the finished blocks).
+
+Plan task 4 adds the interactive half: the message composer (Enter —
+send, Shift+Enter — newline, Esc — stop the run, Ctrl+R — resume it)
+and the clickable options of a pending clarification package. Both
+route to :class:`drcodedesktop.core_shell.CoreShell` — the state
+semantics live in the shell, the pane only forwards.
 """
 
 from __future__ import annotations
@@ -28,6 +34,8 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QPushButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -40,6 +48,7 @@ from .chat_blocks import (
     _right_stamped,
     tool_header_parts,
 )
+from .chat_input import ChatInput
 from .chat_timeline_model import (
     MIN_TIME,
     RenderedTimeline,
@@ -93,6 +102,13 @@ class ChatTimelineView(QWidget):
         # through this map).
         self._collapsible: dict[int, ChatBlockBrowser] = {}
         self._rendered_clarification: object | None = None
+        # The clarification-answer draft state (the TUI's
+        # _clarification_picks / _clarification_multi): per-question
+        # free-text overrides and the accumulated multiple-choice sets,
+        # keyed by question index — survives the debounced rebuilds,
+        # reset when the package changes (view_task / a new package).
+        self._clarification_picks: dict[int, str] = {}
+        self._clarification_multi: dict[int, set[int]] = {}
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -105,9 +121,32 @@ class ChatTimelineView(QWidget):
         self._layout.addStretch(1)
         self._scroll.setWidget(self._container)
 
+        # The input row (plan task 4): the composer + the run controls.
+        # The buttons always fire — the shell's stop/resume report a
+        # no-op through the notify seam instead of the view guessing the
+        # run state from a snapshot.
+        self._input = ChatInput()
+        self._input.submitted.connect(self._submit_input)
+        self._input.stop_requested.connect(self._stop_run)
+        self._input.resume_requested.connect(self._resume_run)
+        self._stop_button = QPushButton("⏹ Stop")
+        self._stop_button.setToolTip("Stop the viewed task's run (Esc)")
+        self._stop_button.clicked.connect(self._stop_run)
+        self._resume_button = QPushButton("↻ Resume")
+        self._resume_button.setToolTip(
+            "Abort a hung run and restart it / resume an aborted attempt (Ctrl+R)"
+        )
+        self._resume_button.clicked.connect(self._resume_run)
+        input_row = QHBoxLayout()
+        input_row.addWidget(self._stop_button)
+        input_row.addWidget(self._resume_button)
+        input_row.addWidget(self._input, stretch=1)
+        input_row.setContentsMargins(0, 4, 0, 0)
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(self._scroll)
+        outer.addWidget(self._scroll, stretch=1)
+        outer.addLayout(input_row)
 
         self._rebuild_timer = QTimer(self)
         self._rebuild_timer.setSingleShot(True)
@@ -130,6 +169,8 @@ class ChatTimelineView(QWidget):
         self._task_id = task_id
         self._expanded.clear()
         self._rendered_clarification = None
+        self._clarification_picks.clear()
+        self._clarification_multi.clear()
         self._rebuild()
 
     def clear_view(self) -> None:
@@ -166,16 +207,29 @@ class ChatTimelineView(QWidget):
         if self._task_id is None or clarification is self._rendered_clarification:
             return
         self._rendered_clarification = clarification
+        self._clarification_picks.clear()
+        self._clarification_multi.clear()
         for line in clarification_entries(clarification):  # type: ignore[arg-type]
             self.live_history_line("system", line)
 
+    def stop_streaming(self) -> None:
+        """The shell's ``_clear_stream_label`` sink: finish every live
+        block (spinner off, tail flushed) — an aborted/superseded run
+        must not leave a spinning block behind."""
+        for block in self._live_blocks:
+            block.finish()
+
     def shutdown(self) -> None:
-        """Project closed: detach from the hub and stop the timers."""
+        """Project closed: detach from the hub, stop the timers and
+        schedule the pane's own deletion — the widget tree (transcript
+        blocks, composer, run controls) must never outlive the
+        application object (a hard Qt crash at teardown otherwise)."""
         self._rebuild_timer.stop()
         self._clear_layout()
         with contextlib.suppress(RuntimeError):
             self._hub.task_updated.disconnect(self._on_task_updated)
             self._hub.service_event.disconnect(self._on_service_event)
+        self.deleteLater()
 
     # -- hub paths ---------------------------------------------------------------
 
@@ -232,6 +286,15 @@ class ChatTimelineView(QWidget):
             self._insert_widget(self._entry_block(entry, index))
         for line in rendered.clarification:
             self._insert_widget(self._line_block("system", line))
+        if rendered.clarification:
+            # A fresh package replaced a previously rendered one: drop
+            # the accumulated answer draft (the picks refer to the old
+            # questions' indexes).
+            if task.clarification is not self._rendered_clarification:
+                self._rendered_clarification = task.clarification
+                self._clarification_picks.clear()
+                self._clarification_multi.clear()
+            self._mount_option_buttons(task.clarification)
         self._reconcile_live_blocks(rendered.entries)
         if follow:
             self._follow_tail(force=True)
@@ -349,7 +412,145 @@ class ChatTimelineView(QWidget):
             kept.append(block)
         self._live_blocks = kept
 
+    def _mount_option_buttons(self, clarification: object) -> None:
+        """The clickable options of the pending clarification package
+        (the TUI's starred option block): one button per combined option
+        — options first, then the agent proposals with a ★. A click on a
+        flat single question submits immediately; a package's /
+        multiple-choice clicks accumulate into the input draft (see
+        ``_pick_option``)."""
+        questions = getattr(clarification, "questions", [])
+        for qi, question in enumerate(questions):
+            options = question.combined_options
+            if not options:
+                continue
+            row = QWidget()
+            row_lay = QHBoxLayout(row)
+            row_lay.setContentsMargins(16, 0, 0, 0)
+            row_lay.setSpacing(4)
+            for oi, option in enumerate(options):
+                star = "★ " if oi >= len(question.options) else ""
+                button = QPushButton(f"{star}{option}")
+                button.setToolTip(f"Answer {qi + 1}: {option}")
+                button.clicked.connect(
+                    lambda _checked=False, a=qi, b=oi: self._pick_option(a, b)
+                )
+                row_lay.addWidget(button)
+            row_lay.addStretch(1)
+            self._insert_widget(row)
+
     # -- interaction ---------------------------------------------------------------
+
+    def _submit_input(self, raw: str) -> None:
+        """The chat composer's Enter: submit the draft to the viewed
+        task — the GUI port of the TUI's ``submit_chat_input``. An empty
+        Enter over an open MULTIPLE-choice clarification is a valid
+        "nothing selected" answer ("(nothing)", the tool docstring tells
+        the agent so); without one an empty input stays a no-op."""
+        if self._task_id is None:
+            return
+        task = self._shell.manager.tasks.get(self._task_id)
+        if task is None:
+            return
+        stripped = raw.strip()
+        if not stripped:
+            if task.clarification is not None and any(
+                q.multiple for q in task.clarification.questions
+            ):
+                stripped = "(nothing)"
+            else:
+                return
+        self._input.clear()
+        self._clarification_picks.clear()
+        self._clarification_multi.clear()
+        self._shell.submit_user_text(self._task_id, stripped)
+
+    def _pick_option(self, question_index: int, option_index: int) -> None:
+        """A clarification option was clicked — the port of the TUI's
+        ``action_pick_option`` (the flat one-question flow plus the
+        package/multiple draft accumulation; the typed-line adoption is
+        kept in a simplified form: a manually edited question line wins
+        over the click set of a multiple question).
+
+        A single-question package of a NON-multiple question submits the
+        option text immediately (the legacy one-question flow). A
+        batched package's click does NOT send alone: it fills the
+        question's line in the composer (one line per question, the
+        option text and/or the user's free text), and Enter submits all
+        the lines as ONE message. A MULTIPLE-choice question never
+        submits on click: the click TOGGLES the option in the
+        question's accumulated set, re-rendered into the question's line
+        as a "; "-joined text; Enter submits the draft as usual (an
+        empty one means "nothing selected")."""
+        if self._task_id is None:
+            return
+        task = self._shell.manager.tasks.get(self._task_id)
+        if task is None or task.clarification is None:
+            return
+        questions = task.clarification.questions
+        if not 0 <= question_index < len(questions):
+            return
+        combined = questions[question_index].combined_options
+        if not 0 <= option_index < len(combined):
+            return
+        text = combined[option_index]
+        if len(questions) == 1 and not questions[0].multiple:
+            self._input.clear()
+            self._clarification_picks.clear()
+            self._clarification_multi.clear()
+            self._shell.submit_user_text(self._task_id, text)
+            return
+
+        def _joined(i: int) -> str:
+            """The "; "-joined rendering of question i's click set."""
+            opts = questions[i].combined_options
+            return "; ".join(
+                opts[j] for j in sorted(self._clarification_multi.get(i, set()))
+            )
+
+        # Adopt the currently typed lines first (free-text answers
+        # already typed into question lines): a non-empty line that is
+        # not the click set's own rendering is a manual override.
+        lines = self._input.toPlainText().splitlines()
+        for i in range(min(len(lines), len(questions))):
+            line = lines[i].strip()
+            if not line or (questions[i].multiple and line == _joined(i)):
+                continue
+            self._clarification_picks[i] = lines[i]
+        if questions[question_index].multiple:
+            # A click on the question itself expresses "use the click
+            # set": drop any manual override for it, then toggle.
+            self._clarification_picks.pop(question_index, None)
+            selected = self._clarification_multi.setdefault(question_index, set())
+            if option_index in selected:
+                selected.discard(option_index)
+            else:
+                selected.add(option_index)
+        else:
+            self._clarification_picks[question_index] = text
+        draft: list[str] = []
+        for i, q in enumerate(questions):
+            if q.multiple:
+                manual = self._clarification_picks.get(i)
+                draft.append(manual if manual is not None else _joined(i))
+            else:
+                draft.append(self._clarification_picks.get(i, ""))
+        while draft and not draft[-1].strip():
+            draft.pop()
+        self._input.setPlainText("\n".join(draft))
+        self._input.setFocus()
+
+    def _stop_run(self) -> None:
+        """Stop the viewed task's run (Esc / ⏹ Stop): the shell decides
+        what the stop means (single slot — the live run; parallel slots —
+        the viewed task's own) and reports a no-op itself."""
+        self._shell.stop_viewed_run()
+
+    def _resume_run(self) -> None:
+        """Resume the viewed task's run (Ctrl+R / ↻ Resume): the shell's
+        nudge — abort a hung run and restart it, or resume an aborted
+        attempt as a continuation turn."""
+        self._shell.resume_viewed_run()
 
     def _on_anchor(self, href: str) -> None:
         if href.startswith("drcode:toggle:"):

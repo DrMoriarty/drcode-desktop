@@ -240,6 +240,14 @@ class QtHost(QObject):
         if sink is not None and getattr(sink, "task_id", None) == self.current_task_id:
             sink.live_clarification(clarification)
 
+    def stream_sink_stop_streaming(self) -> None:
+        """Finish the open view's live stream blocks (the shell's
+        ``_clear_stream_label`` analogue: an aborted/superseded run must
+        not leave spinning blocks behind)."""
+        sink = self._stream_sink
+        if sink is not None and getattr(sink, "task_id", None) == self.current_task_id:
+            sink.stop_streaming()
+
     def stream_sink_at_bottom(self) -> bool:
         """The TUI's _chat_at_bottom: is the open view tracking the tail?"""
         sink = self._stream_sink
