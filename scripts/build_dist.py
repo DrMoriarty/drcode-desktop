@@ -93,7 +93,9 @@ def run(cmd: list[str | Path], **kwargs: object) -> subprocess.CompletedProcess:
 def generate_icon(path: Path, size: int = 512) -> Path:
     """Render the placeholder app icon with Pillow (prompt glyph on tile)."""
     try:
-        from PIL import Image, ImageDraw
+        # Pillow is a build-group dependency, not required in the dev venv;
+        # the guarded import degrades to a friendly error below.
+        from PIL import Image, ImageDraw  # pyright: ignore[reportMissingImports]
     except ImportError as exc:
         raise SystemExit(
             "Pillow is required for icon generation (uv sync --group build)"
@@ -135,7 +137,7 @@ def ensure_icns(png_path: Path, icns_path: Path) -> Path:
     iconset = icns_path.parent / f"{EXE_NAME}.iconset"
     iconset.mkdir(parents=True, exist_ok=True)
     try:
-        from PIL import Image
+        from PIL import Image  # pyright: ignore[reportMissingImports]
 
         img = Image.open(png_path)
         for size in (16, 32, 128, 256, 512):
