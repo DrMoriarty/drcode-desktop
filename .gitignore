@@ -6,3 +6,11 @@ __pycache__/
 dist/
 build/
 dist-desktop/
+.drcode/tasks/
+.drcode/settings.json
+.drcode/github_state.json
+.drcode/search_index.json
+.drcode/worktrees/
+.drcode/merge_reports/
+.drcode/stats.json
+.drcode/pending_notifications.json
