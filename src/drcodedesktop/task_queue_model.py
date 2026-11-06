@@ -110,6 +110,12 @@ class TaskRow:
     needs_human: bool
     hold: bool
     cancelled: bool
+    #: Mergedness of a COMPLETED task's ``drcode/<id>`` branch, the
+    #: shell's git snapshot verdict: ``"merged"`` (влито в базу),
+    #: ``"unmerged"`` (коммит есть, мержа нет), ``"none"`` (ветки нет —
+    #: коммита не было и не нужно, напр. research) — или ``""``, когда
+    #: вердикта ещё нет (изоляция выключена / снапшот не считался).
+    merge_state: str
     title: str
     #: The dependency-gate suffix ("🔒 ⇢ <ids>") or "".
     deps_marker: str
@@ -140,14 +146,15 @@ class TaskRow:
 @dataclass(frozen=True)
 class TaskSection:
     """A sidebar section: its header name and the task rows in display
-    order (the header text "- QUEUE (3)" mirrors the TUI's collapse
-    glyph convention)."""
+    order (the header text ``QUEUE (3)`` — the TUI's ``-``/``+``
+    collapse glyph is NOT reproduced: the GUI collapses with its own
+    chevron, so the leftover dash would be noise)."""
 
     name: str
     rows: list[TaskRow]
 
     def header(self) -> str:
-        return f"- {self.name} ({len(self.rows)})"
+        return f"{self.name} ({len(self.rows)})"
 
 
 class TaskQueueModel(QObject):
@@ -306,6 +313,11 @@ class TaskQueueModel(QObject):
         resolving = shell._resolver_running and shell._resolver_task_id == task.id
         marker = "⚙" if resolving else STATUS_MARKERS.get(task.status.value, "⏳")
         kind_letter = KIND_LETTERS[task.kind]
+        merge_state = (
+            shell._merge_state.get(task.id, "")
+            if task.status is TaskStatus.COMPLETED
+            else ""
+        )
         if task.verification is VerificationStatus.PASSED:
             verification, glyph = task.verification.value, "✅"
         elif task.verification is VerificationStatus.FAILED:
@@ -334,6 +346,7 @@ class TaskQueueModel(QObject):
             needs_human=task.needs_human,
             hold=task.status is TaskStatus.HOLD,
             cancelled=task.cancelled,
+            merge_state=merge_state,
             title=title,
             deps_marker=deps_marker,
             goal_marker=goal_marker,

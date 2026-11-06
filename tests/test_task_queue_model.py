@@ -19,6 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from drcode.models import TaskStatus
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 from qasync import QEventLoop
 
@@ -226,13 +227,79 @@ def test_view_renders_the_model_tree(tmp_path: Path) -> None:
     tree = view._tree
     assert tree.topLevelItemCount() == 2  # QUEUE + ON HOLD
     queue = tree.topLevelItem(0)
-    assert queue.text(0) == "- QUEUE (1)"
+    assert queue.text(0) == "QUEUE (1)"
+    # The group header spans every column: the name + count never
+    # truncate against the id column width.
+    assert queue.isFirstColumnSpanned()
     row = queue.child(0)
-    assert row.text(0).startswith("#")
-    assert row.text(1) == "F"
-    assert row.text(2).startswith("◷ queued")
+    # Columns: markers | done | kind+id | title.
+    assert row.text(0) == ""
+    assert row.text(1) == ""
+    assert row.text(2) == f"F #{row.data(0, Qt.ItemDataRole.UserRole)}"
+    assert row.text(3) == "Queued feature"
+    # The tooltip carries the FULL title, not the on-screen head.
+    assert row.toolTip(3) == "Queued feature"
     held_section = tree.topLevelItem(1)
-    assert held_section.text(0) == "- ON HOLD (1)"
-    assert "⏸ hold" in held_section.child(0).text(4)
+    assert held_section.text(0) == "ON HOLD (1)"
+    held_row = held_section.child(0)
+    assert held_row.text(1) == ""  # not completed → no ✓
+    assert held_row.text(3) == "Held feature"
+    view.shutdown()
+    del app
+
+
+def test_completed_checkmark_colors_and_markers(tmp_path: Path) -> None:
+    """The ✓ of a COMPLETED row is colored by mergedness (the shell's
+    git snapshot verdict: green merged / yellow unmerged / gray no
+    branch); the markers column hosts the verification glyph and the
+    cancelled cross in one cell."""
+
+    def complete(shell: CoreShell, _model: TaskQueueModel) -> None:
+        merged = shell.manager.create("Merged task", "d", origin="user")
+        unmerged = shell.manager.create("Unmerged task", "d", origin="user")
+        for task in (merged, unmerged):
+            shell.manager.complete_without_verification(task.id)
+        # The wholesale git snapshot verdict the activity poll computes
+        # (the GUI test stubs it — the real git walk is another test's
+        # job).
+        shell._merge_state = {merged.id: "merged", unmerged.id: "unmerged"}
+
+    shell, _model = run_queue_scenario(tmp_path, complete)
+    app = QApplication.instance() or QApplication([])
+    hub = EventHub(log_path=None)
+    view = TaskQueueView(shell, hub)
+    completed = view._tree.topLevelItem(0)
+    assert completed.text(0).startswith("COMPLETED (")
+    rows = {
+        completed.child(i).text(3): completed.child(i)
+        for i in range(completed.childCount())
+    }
+    merged_row = rows["Merged task"]
+    unmerged_row = rows["Unmerged task"]
+    assert merged_row.text(1) == "✓"
+    assert merged_row.foreground(1).color().name() == "#98c379"  # green
+    assert unmerged_row.text(1) == "✓"
+    assert unmerged_row.foreground(1).color().name() == "#e5c07b"  # yellow
+    # No branch (research, no commits): the gray ✓.
+    shell._merge_state = {}
+    view.rebuild()
+    completed = view._tree.topLevelItem(0)
+    gray_row = completed.child(0)
+    assert gray_row.text(1) == "✓"
+    assert gray_row.foreground(1).color().name() == "#787c82"  # gray
+    # Markers: ✅/❌ verification and ✖ cancelled — one column.
+    merged_id = next(
+        t.id for t in shell.manager.tasks.values() if t.title == "Merged task"
+    )
+    shell.manager.tasks[merged_id].cancelled = True
+    shell._hub.emit_task_updated(merged_id, "completed")
+    view.rebuild()
+    completed = view._tree.topLevelItem(0)
+    cancelled_row = next(
+        completed.child(i)
+        for i in range(completed.childCount())
+        if completed.child(i).text(3) == "Merged task"
+    )
+    assert "✖" in cancelled_row.text(0)
     view.shutdown()
     del app

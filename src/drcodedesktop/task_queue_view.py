@@ -1,11 +1,24 @@
 """The live task-queue screen (plan task 2): a QTreeWidget mirroring the
 TUI sidebar's sections and rows, refreshed in real time.
 
-Structure: one bold top-level item per non-empty section (``- QUEUE (3)``,
-the TUI's collapse-glyph convention) with the section's task rows as
-children. Columns: id, kind (the colored B/R/F letter), status (marker +
-value), verification, flags (unfinished / needs-human / hold /
-cancelled) and the title — the plan's column set.
+Structure: one bold top-level item per non-empty section
+(``QUEUE (3)`` — no TUI ``-`` glyph, the GUI collapses with its own
+chevron) spanning every column, so the header never truncates. The
+task-row columns are the GUI's own compact set:
+
+- markers — the attention glyphs in one fixed column: the verification
+  verdict (✅/❌), cancelled (✖), needs-human (✋), unfinished (⏸) and
+  the live resolver gear (⚙);
+- done — the ✓ of a COMPLETED task, colored by mergedness (green =
+  merged into the base, yellow = committed but unmerged, gray = no
+  branch / no commit, e.g. research);
+- id — the kind letter (B/R/F, the kind color) + ``#<id>``, auto-sized
+  so nothing truncates;
+- title — the title's head (the full text is one hover away in the
+  tooltip).
+
+Status is not a column: the section header (QUEUE / ACTIVE / TESTING /
+COMPLETED / ON HOLD / …) already says it.
 
 Updates arrive two ways, both pushed by the model
 (:class:`~drcodedesktop.task_queue_model.TaskQueueModel`): the hub's
@@ -23,7 +36,7 @@ shell, the menu only forwards).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from drcode import merge_engine
 from drcode.models import TaskStatus
@@ -50,13 +63,28 @@ if TYPE_CHECKING:
     from .core_shell import CoreShell
     from .event_hub import EventHub
 
-_COLUMNS = ("id", "kind", "status", "verification", "flags", "title")
+_COLUMNS = ("", "✓", "id", "task")
 
 _KIND_ROLE_COLORS = {
     "red": QColor(224, 108, 117),
     "yellow": QColor(229, 192, 123),
     "green": QColor(152, 195, 121),
 }
+
+#: The ✓ color of a COMPLETED row by mergedness (the shell's git
+#: snapshot verdict): merged / committed-but-unmerged / no branch.
+_MERGE_STATE_COLORS = {
+    "merged": QColor(152, 195, 121),
+    "unmerged": QColor(229, 192, 123),
+    "none": QColor(120, 124, 130),
+}
+_MERGE_STATE_UNKNOWN_COLOR = QColor(120, 124, 130)
+
+#: The needs-human / unfinished flags of the old Flags column live in
+#: the markers column too (the verification / cancelled glyphs are its
+#: primary tenants).
+_UNFINISHED_COLOR = QColor(229, 192, 123)
+_NEEDS_HUMAN_COLOR = QColor(224, 108, 117)
 
 
 class TaskQueueView(QWidget):
@@ -251,47 +279,69 @@ class TaskQueueView(QWidget):
         self._tree.clear()
         self._items: dict[str, QTreeWidgetItem] = {}
         for section in self._model.sections():
-            header = QTreeWidgetItem([section.header(), "", "", "", "", ""])
+            header = QTreeWidgetItem([section.header(), "", "", ""])
             header.setFlags(Qt.ItemFlag.ItemIsEnabled)
             font = header.font(0)
             font.setBold(True)
             header.setFont(0, font)
             self._tree.addTopLevelItem(header)
+            # Span every column: the group name + count render over the
+            # whole tree width and never truncate against the id column.
+            header.setFirstColumnSpanned(True)
             header.setExpanded(True)
             for row in section.rows:
                 item = QTreeWidgetItem(
                     [
-                        f"#{row.task_id}",
-                        row.kind_letter,
-                        row.status_label,
-                        (
-                            f"{row.verification_glyph} {row.verification}"
-                            if row.verification
-                            else ""
-                        ),
-                        " ".join(row.flag_fragments()),
-                        row.title,
+                        self._markers_text(row),
+                        "✓" if row.status is TaskStatus.COMPLETED else "",
+                        f"{row.kind_letter} #{row.task_id}",
+                        row.title + row.deps_marker + row.goal_marker,
                     ]
                 )
                 item.setData(0, Qt.ItemDataRole.UserRole, row.task_id)
-                item.setToolTip(5, row.label)
+                item.setToolTip(3, row.title)
                 color = _KIND_ROLE_COLORS.get(row.kind_color)
                 if color is not None:
-                    item.setForeground(1, QBrush(color))
+                    item.setForeground(2, QBrush(color))
+                if row.status is TaskStatus.COMPLETED:
+                    done_color = _MERGE_STATE_COLORS.get(
+                        row.merge_state, _MERGE_STATE_UNKNOWN_COLOR
+                    )
+                    done_font = item.font(1)
+                    done_font.setBold(True)
+                    item.setFont(1, done_font)
+                    item.setForeground(1, QBrush(done_color))
                 if row.needs_human:
-                    item.setForeground(4, QBrush(QColor(224, 108, 117)))
+                    item.setForeground(0, QBrush(_NEEDS_HUMAN_COLOR))
                 elif row.unfinished:
-                    item.setForeground(4, QBrush(QColor(229, 192, 123)))
+                    item.setForeground(0, QBrush(_UNFINISHED_COLOR))
                 header.addChild(item)
                 self._items[row.task_id] = item
-        self._tree.setColumnWidth(0, 90)
-        self._tree.setColumnWidth(1, 40)
-        self._tree.setColumnWidth(2, 120)
-        self._tree.setColumnWidth(3, 220)
-        self._tree.setColumnWidth(4, 180)
+        # The marker / ✓ / id columns hug their content (the id must fit
+        # without truncation); the title column takes the rest.
+        for column in range(3):
+            self._tree.resizeColumnToContents(column)
         if current_id and current_id in self._items:
             self._tree.setCurrentItem(self._items[current_id])
         self._tree.blockSignals(False)
+
+    @staticmethod
+    def _markers_text(row: Any) -> str:
+        """The markers column: every attention glyph of the row in one
+        cell (the verification verdict, the cancelled cross, the
+        needs-human / unfinished flags, the live resolver gear)."""
+        bits: list[str] = []
+        if row.cancelled:
+            bits.append("✖")
+        if row.verification_glyph:
+            bits.append(row.verification_glyph)
+        if row.needs_human:
+            bits.append("✋")
+        if row.unfinished:
+            bits.append("⏸")
+        if row.resolving:
+            bits.append("⚙")
+        return " ".join(bits)
 
     def shutdown(self) -> None:
         """Detach from the core (project closed): stop the poll and
