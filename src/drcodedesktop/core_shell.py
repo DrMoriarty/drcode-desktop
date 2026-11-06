@@ -248,6 +248,11 @@ class CoreShell(PipelineLayer):
         self._tester_generation = 0
         # Context fill / compaction bookkeeping.
         self._live_ctx_tokens: dict[str, int] = {}
+        # Eviction credit per task (see drcode.core.state): the ≈tokens the
+        # batch eviction of agent-marked tool results collapsed, subtracted
+        # from the dev transcript's fill readings until a fresh usage
+        # report consumes it.
+        self._evicted_ctx_tokens: dict[str, int] = {}
         self._live_ctx_tester: dict[str, int] = {}
         self._live_ctx_resolver: dict[str, int] = {}
         self._compaction_failed: set[str] = set()
