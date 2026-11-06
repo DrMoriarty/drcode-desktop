@@ -33,6 +33,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QTimer, Signal
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QPushButton,
@@ -46,6 +47,7 @@ from .chat_blocks import (
     ChatBlockBrowser,
     StreamBlockBrowser,
     _right_stamped,
+    set_chat_font,
     tool_header_parts,
 )
 from .chat_input import ChatInput
@@ -180,6 +182,18 @@ class ChatTimelineView(QWidget):
         self._clarification_picks.clear()
         self._clarification_multi.clear()
         self._rebuild()
+
+    def apply_font(self, font: QFont) -> None:
+        """The Preferences Apply: restyle every mounted block (history,
+        live stream, the empty-pane hint) and set the font future blocks
+        render with (the module-level default in chat_blocks)."""
+        set_chat_font(font)
+        for index in range(self._layout.count()):
+            widget = self._layout.itemAt(index).widget()
+            if isinstance(widget, ChatBlockBrowser):
+                widget.apply_font(font)
+        for block in self._live_blocks:
+            block.apply_font(font)
 
     def clear_view(self) -> None:
         """No task selected: an empty pane (detaches live blocks)."""

@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any
 from drcode import merge_engine
 from drcode.models import TaskStatus
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
@@ -138,6 +138,12 @@ class TaskQueueView(QWidget):
         self._poll.setInterval(1000)
         self._poll.timeout.connect(self._model.refresh)
         self._poll.start()
+
+    def apply_font(self, font: QFont) -> None:
+        """The Preferences Apply: the shared chat/queue font on the task
+        tree (a rebuild re-measures the auto-sized columns)."""
+        self._tree.setFont(QFont(font))
+        self.rebuild()
 
     def row_item(self, task_id: str) -> QTreeWidgetItem | None:
         """The tree item of a task row (tests, the chat-pane link)."""

@@ -27,7 +27,7 @@ from datetime import datetime
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFontDatabase, QPalette
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 from PySide6.QtWidgets import QTextBrowser
 
 from .rich_to_qt import json_body_html, markdown_body_html
@@ -35,6 +35,29 @@ from .rich_to_qt import json_body_html, markdown_body_html
 # The chat pane palette (the terminal's dark theme, approximated).
 CHAT_BG = "#111318"
 CHAT_FG = "#c8ccd4"
+
+# The chat font (Preferences): one family+size pair shared by the chat
+# pane and the task queue. None = the system fixed font (the behaviour
+# before the Preferences dialog existed). New blocks read it at
+# creation; existing ones are re-styled by the view's apply_font walk.
+_chat_font: QFont | None = None
+
+
+def default_chat_font() -> QFont:
+    """The effective chat font: the configured family/size over the
+    system fixed font (the fallback keeps the pre-Preferences look)."""
+    font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+    if _chat_font is not None:
+        font = QFont(_chat_font)
+    return font
+
+
+def set_chat_font(font: QFont | None) -> None:
+    """Set the font every NEW chat block renders with (None = reset to
+    the system fixed font); existing blocks are restyled by
+    :meth:`ChatBlockBrowser.apply_font` calls from the view."""
+    global _chat_font
+    _chat_font = QFont(font) if font is not None else None
 
 # Tool-call header constants — the TUI's ToolCallBlock port.
 _MAIN_PARAM_KEYS = ("path", "command", "pattern", "question")
@@ -110,9 +133,7 @@ class ChatBlockBrowser(QTextBrowser):
         self.setFrameShape(QTextBrowser.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.document().setDefaultFont(
-            QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
-        )
+        self.document().setDefaultFont(default_chat_font())
         palette = self.palette()
         palette.setColor(QPalette.ColorRole.Base, QColor(CHAT_BG))
         palette.setColor(QPalette.ColorRole.Text, QColor(CHAT_FG))
@@ -123,6 +144,13 @@ class ChatBlockBrowser(QTextBrowser):
 
     def _on_anchor(self, url: Any) -> None:
         self.anchor_activated.emit(url.toString())
+
+    def apply_font(self, font: QFont) -> None:
+        """Restyle this already-mounted block (the Preferences Apply):
+        swap the document's default font and re-fit the height — the
+        document re-lays its existing HTML out with the new font."""
+        self.document().setDefaultFont(QFont(font))
+        self._fit_height()
 
     # -- auto height ----------------------------------------------------------
 

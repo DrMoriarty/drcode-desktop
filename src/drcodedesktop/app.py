@@ -39,10 +39,12 @@ from .merge_model import UnmergedEntry, collect_unmerged_entries
 from .model_catalog_dialog import ModelCatalogDialog
 from .model_settings_dialog import ModelSettingsDialog
 from .notifications_dialog import NotificationsDialog
+from .preferences_dialog import PreferencesDialog, chat_font
 from .qt_host import QtHost
 from .settings_dialog import ProjectSettingsDialog
 from .stats_dialog import StatsDialog
 from .task_queue_view import TaskQueueView
+from .tray_notifications import TrayNotifier
 from .unmerged_screen import UnmergedDialog
 from .usage_dialog import UsageDialog
 
@@ -131,6 +133,22 @@ class MainWindow(QMainWindow):
         self.menuBar().addMenu(merge_menu)
         self._merge_action.setEnabled(False)
 
+        # The shell's OWN preferences (the font pair + the tray
+        # notification checkboxes of gui.json — nothing to do with the
+        # project's drcode settings). Always available, even without an
+        # open project; on macOS the PreferencesRole action lands in the
+        # application menu with Cmd+, automatically.
+        self._preferences_action = QAction("&Preferences…", self)
+        self._preferences_action.setMenuRole(QAction.MenuRole.PreferencesRole)
+        self._preferences_action.setShortcut(QKeySequence("Ctrl+,"))
+        self._preferences_action.triggered.connect(self._open_preferences)
+        self.menuBar().addAction(self._preferences_action)
+
+        # The system-tray notification channel (created once, lives
+        # across projects; it shows itself only with a project open AND
+        # at least one notification kind enabled).
+        self._tray = TrayNotifier(config, self)
+
     # -- project lifecycle ----------------------------------------------------
 
     def open_project(self, project_root: Path) -> None:
@@ -151,8 +169,10 @@ class MainWindow(QMainWindow):
         self._hub.host_log.connect(self._console_append)
 
         self._host = QtHost(self._hub)
-        self._shell = CoreShell(project_root, self._host, self._hub)
+        self._shell = CoreShell(project_root, self._host, self._hub, tray=self._tray)
         self._install_queue_view()
+        self.apply_font_settings()
+        self._tray.set_project(project_root.name)
         self._config.remember_project(project_root)
         self._fill_recents_menu()
         self._model_label.setText(project_root.name)
@@ -189,6 +209,7 @@ class MainWindow(QMainWindow):
             self._shell = None
         self._host = None
         self._hub = None
+        self._tray.set_project(None)
         self._model_label.setText("no project")
         self._settings_project_action.setEnabled(False)
         self._settings_models_action.setEnabled(False)
@@ -235,6 +256,32 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
         self.close_project()
         super().closeEvent(event)
+
+    # -- shell preferences (the GUI's own gui.json, not the project) ---------
+
+    def _open_preferences(self) -> None:
+        """Preferences… (Cmd+, on macOS): the shell's own font pair and
+        tray-notification checkboxes. Available with or without an open
+        project; OK/Apply persist into gui.json and re-apply to the
+        open views immediately."""
+        dialog = PreferencesDialog(self._config, self)
+        dialog.applied.connect(self._preferences_applied)
+        dialog.exec()
+
+    def _preferences_applied(self) -> None:
+        """The dialog wrote new values into the config: restyle the open
+        views and refresh the tray icon (no project reopen needed)."""
+        self.apply_font_settings()
+        self._tray.refresh()
+
+    def apply_font_settings(self) -> None:
+        """Apply the configured font pair to the open task window (chat
+        pane) and task list (Queue tree); no-op without a project."""
+        font = chat_font(self._config)
+        if self._chat_view is not None:
+            self._chat_view.apply_font(font)
+        if self._queue_view is not None:
+            self._queue_view.apply_font(font)
 
     # -- pickers ---------------------------------------------------------------
 

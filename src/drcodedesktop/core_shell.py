@@ -64,12 +64,19 @@ from PySide6.QtCore import QTimer
 from .activity_view import fmt_age
 from .event_hub import EventHub
 from .qt_host import QtHost
+from .tray_notifications import TrayEventBridge, TrayNotifier
 
 
 class CoreShell(PipelineLayer):
     """One live drcode core, driven headless through the Qt host."""
 
-    def __init__(self, project_root: Path, host: QtHost, hub: EventHub) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        host: QtHost,
+        hub: EventHub,
+        tray: TrayNotifier | None = None,
+    ) -> None:
         self._intervals: list[QTimer] = []
         # CoreState / layer attributes are assigned by this __init__ —
         # the same contract DrCodeApp.__init__ owns for the TUI.
@@ -120,13 +127,33 @@ class CoreShell(PipelineLayer):
         self._github_next_sync = time.monotonic() + 15.0
         self._github_syncing = False
         self._github_last_error: str | None = None
-        # ntfy.sh notifications (no TTS speaker in the shell yet).
-        self.notifier = Notifier(
-            lambda: self.settings,
-            project=project_root.name,
-            project_root=project_root,
-            on_error=self._notify_error,
-        )
+        # ntfy.sh notifications (no TTS speaker in the shell yet). With a
+        # tray bridge the notifier ALSO taps the pipeline's settled/busy
+        # transitions for the GUI's own tray notifications (the ntfy
+        # behaviour itself is untouched; per-task ntfy events stay
+        # unwired in the shell — the tray listens to the manager
+        # directly below).
+        if tray is None:
+            notifier: Notifier = Notifier(
+                lambda: self.settings,
+                project=project_root.name,
+                project_root=project_root,
+                on_error=self._notify_error,
+            )
+        else:
+            notifier = TrayEventBridge(
+                tray,
+                lambda: self.settings,
+                project=project_root.name,
+                project_root=project_root,
+                on_error=self._notify_error,
+            )
+            # The GUI's own tray notifications: system-origin task
+            # transitions (the announcement-language source rides the
+            # live settings instance).
+            tray.set_settings_getter(lambda: self.settings)
+            self.manager.add_status_listener(tray.task_transition)
+        self.notifier = notifier
         # Keep-awake (system-sleep assertion while the pipeline has work).
         self.keepawake = KeepAwake()
         # "Queue empty" notifications fire on transitions only.
@@ -787,14 +814,18 @@ class CoreShell(PipelineLayer):
     #: TUI's activity-view constant: the cancellation must settle first).
     _NUDGE_RESTART_DELAY = 1.0
 
-    def _nudge_run(self, task: Task) -> None:
+    def _nudge_run(self, task: Task, *, source: str = "watchdog") -> bool:
         """Abort the hung/stalled run for `task` (if one is in flight)
         and schedule its restart — the port of
         ``tui.activity_view._nudge_run`` (Ctrl+R, and the same move the
         stall watchdog makes automatically). The agent resumes via a
         continuation turn (no text is re-sent — ``task.unfinished``
         marks the interrupted attempt); a TESTING task gets a fresh
-        verification round via the pipeline gate."""
+        verification round via the pipeline gate. `source` is accepted
+        for the core protocol (the restart event wording of the TUI);
+        returns whether a restart was scheduled."""
+        del source
+        scheduled = False
         if task.status is TaskStatus.ACTIVE:
             if task.id in self._agent_runs:
                 self._host.cancel_worker_group(f"agent-{task.id}")
@@ -805,6 +836,7 @@ class CoreShell(PipelineLayer):
             self._schedule_pipeline_timer(
                 self._NUDGE_RESTART_DELAY, partial(self.run_agent, task.id)
             )
+            scheduled = True
         elif task.status is TaskStatus.TESTING:
             if self.tester_running:
                 self._host.cancel_worker_group("tester")
@@ -812,6 +844,7 @@ class CoreShell(PipelineLayer):
                 self._current_tool[task.id] = None
                 self.refresh_status()
             self._schedule_pipeline_timer(self._NUDGE_RESTART_DELAY, self._advance)
+            scheduled = True
         elif self.tester_running and self._tester_task_id == task.id:
             # The run hung AFTER its useful work: the status already
             # moved on mid-run, but the hung tester worker keeps
@@ -835,6 +868,7 @@ class CoreShell(PipelineLayer):
                 self._NUDGE_RESTART_DELAY, partial(self.run_resolver, task.id)
             )
         self.refresh_sidebar()
+        return scheduled
 
     def resume_viewed_run(self) -> bool:
         """Ctrl+R on the viewed task: abort its hung or stalled run and

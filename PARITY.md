@@ -136,6 +136,37 @@
 - [x] Отдельных колонок kind / status / flags больше нет: статус виден
   по секции, тип — буква в id-колонке.
 
+## 5a. Настройки самого шелла + системные уведомления — GUI-only добавка
+
+Аналога в TUI нет: это собственные настройки GUI (не drcode) и свой
+канал доставки. Ntfy-поведение шелла не менялось (per-task
+`notifier.task_status` в шелле по-прежнему не подключён), озвучка
+(voice_tts_*) не затронута, `drcode/` не тронут.
+
+- [x] Пункт меню «Preferences…» (`QAction.MenuRole.PreferencesRole`,
+  на macOS — в меню приложения с Cmd+,) — доступен всегда, даже без
+  открытого проекта; `preferences_dialog.py`.
+- [x] Шрифт: ОДНА пара «семейство + размер» (gui.json:
+  `font_family`/`font_size`, ""/0 = системный fixed-шрифт) для чата
+  (`chat_blocks.default_chat_font` + `apply_font` у блоков и
+  `ChatTimelineView`) и списка задач (`TaskQueueView.apply_font`);
+  применяется к открытым вью сразу (OK/Apply), без переоткрытия проекта.
+- [x] Уведомления: 4 независимых от voice_tts_* чекбокса (gui.json
+  `notify_completed` / `notify_tester_failed` / `notify_clarification` /
+  `notify_pipeline`), по умолчанию выключены.
+- [x] Доставка — `tray_notifications.py`: `QSystemTrayIcon.showMessage`;
+  иконка видна, пока открыт проект И включён хотя бы один тип.
+- [x] Источник событий: GUI-собственный слушатель статусов менеджера
+  (только origin == "system"; завершение / провал тестера — TESTING→QUEUED
+  и FAILED-вердикт / уточнение) + settled-состояния (пусто/заблокировано)
+  через `TrayEventBridge(Notifier)` — piggyback на существующие вызовы
+  `notifier.pipeline_idle`/`pipeline_busy` пайплайна, ntfy-путь не тронут;
+  prime при старте, дедуп по смене состояния (как `_notifications_primed`).
+- [x] Тексты — переиспользованы из ядра: `_status_text` и фраза
+  `queue_empty` из `drcode.voice` (в языке объявлений проекта).
+- [x] Уведомление не показывается, когда главное окно активно
+  (`isActiveWindow()`).
+
 ## Приёмка
 
 - [x] Все источники данных — `drcode.core` / `usage_store` / `stats` /
